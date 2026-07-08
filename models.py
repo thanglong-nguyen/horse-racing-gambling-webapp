@@ -1,7 +1,7 @@
 import random
 import math
 from race_track import (
-    a_star, compute_ray_neighbors, has_immediate_blocker,
+    triomphe , compute_ray_neighbors, has_immediate_blocker,
     build_path_reservation, build_projected_reservation,
 )
 
@@ -275,35 +275,7 @@ class Race:
     # ---------- core simulation ----------
 
     def advance_one_tick(self):
-        """Advance all horses by one tick using A* as short-horizon planner.
-
-        Movement is computed in two phases so horses are planned
-        simultaneously rather than sequentially:
-
-        1) PLAN: every horse plans against the SAME frozen blocking
-           snapshot — wherever everyone ended up at the end of the
-           PREVIOUS tick. This snapshot is not touched while horses are
-           planning, so whichever horse happens to be first in
-           self.states gets no advantage from "moving" before the
-           others see the board.
-        2) COMMIT: once everyone's move for this tick is known, state is
-           updated and the blocked map is rebuilt from those new final
-           positions, ready for the *next* tick's planning phase.
-
-        (Previously, the blocked map was mutated horse-by-horse inside a
-        single loop, so a horse processed earlier could advance past
-        another horse's start-of-tick position and "leave behind" a
-        blocked tail that the later horse's planner would then dodge —
-        even though the two never actually overlapped in real time.)
-
-        Each occupancy entry also carries the blocking horse's snapshot
-        speed, so a_star can treat it as a MOVING obstacle rather than a
-        wall frozen for the whole tick: a node only counts as blocked for
-        as long as the blocker's body (projected forward at that speed)
-        would still be on top of it. This is what stops a trailing horse
-        from needlessly detouring around a leader who, in reality, will
-        have already moved on by the time the trailing horse gets there.
-        """
+        """Advance all horses by one tick using A* as short-horizon planner."""
 
         planned = []  # (state, final_node, new_total_time, final_stamina, final_speed)
 
@@ -351,7 +323,7 @@ class Race:
                 final_speed,
                 final_stamina,
                 new_disabled_lanes
-            ) = a_star(
+            ) = triomphe (
                 s.node,
                 self.track.finish_node,
                 self.track,
