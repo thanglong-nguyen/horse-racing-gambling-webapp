@@ -3,7 +3,7 @@ from Stamina import *
 import math
 import heapq
 
-def a_star(
+def triomphe (
     start_node,
     end_node,
     track,
