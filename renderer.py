@@ -2,8 +2,9 @@ import pygame
 
 class RaceRendererPygame:
 
-    def __init__(self, race):
+    def __init__(self, race, show_debug_rays=True):
         self.race = race
+        self.show_debug_rays = show_debug_rays
         pygame.init()
 
         self.window_w = 1200
@@ -86,11 +87,31 @@ class RaceRendererPygame:
             time_surf = self.font_small.render(time_text, True, (200, 200, 200))
             self.screen.blit(time_surf, (px + 10, py + 5))
 
+    def draw_debug_rays(self):
+        # Draws every candidate lane-change ray a horse is currently
+        # considering, in that horse's own colour, with a small marker
+        # where the ray actually crosses into the other lane. Horses with
+        # no rays this tick (lane 0, nothing in the way) simply draw
+        # nothing here — that's the "not worth considering" case made
+        # visible.
+        for i, s in enumerate(self.race.states):
+            if not s.debug_rays:
+                continue
+            color = self.colours[i % len(self.colours)]
+            sx, sy = s.node.get_coordinates()
+            spx, spy = self.world_to_screen(sx, sy)
+            for target_node, distance in s.debug_rays:
+                tx, ty = target_node.get_coordinates()
+                tpx, tpy = self.world_to_screen(tx, ty)
+                pygame.draw.line(self.screen, color, (spx, spy), (tpx, tpy), 1)
+                pygame.draw.circle(self.screen, color, (tpx, tpy), 4, 1)
+
     def draw_hud(self):
         # simple HUD: show tick dt and whether all finished
         all_finished = all(st.finished for st in self.race.states)
         status = "FINISHED" if all_finished else "RUNNING"
-        hud_text = f"dt={self.race.tick_dt:.2f}s   status={status}"
+        ray_status = "ON" if self.show_debug_rays else "OFF"
+        hud_text = f"dt={self.race.tick_dt:.2f}s   status={status}   rays={ray_status} (R to toggle)"
         hud_surf = self.font_medium.render(hud_text, True, (220, 220, 220))
         self.screen.blit(hud_surf, (20, 20))
 
@@ -107,6 +128,8 @@ class RaceRendererPygame:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_r:
+                    self.show_debug_rays = not self.show_debug_rays
 
             # advance simulation in fixed-size steps (tick_dt) as real time allows
             while sim_accum >= self.race.tick_dt and not all(s.finished for s in self.race.states):
@@ -116,9 +139,10 @@ class RaceRendererPygame:
             # draw
             self.screen.fill((10, 10, 10))
             self.draw_track()
+            if self.show_debug_rays:
+                self.draw_debug_rays()
             self.draw_horses()
             self.draw_hud()
             pygame.display.flip()
 
         pygame.quit()
-
