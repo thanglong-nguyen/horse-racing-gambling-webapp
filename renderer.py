@@ -146,3 +146,72 @@ class RaceRendererPygame:
             pygame.display.flip()
 
         pygame.quit()
+
+
+class RaceReplayRenderer(RaceRendererPygame):
+    """
+    Plays back an ALREADY-RUN race by interpolating each horse's
+    timestamped history, instead of stepping the simulation forward
+    live. The race's tick_dt has no bearing on how this looks — it's
+    driven purely by wall-clock playback time, so it renders just as
+    smoothly at 60fps whether the underlying simulation used
+    tick_dt=0.5 or tick_dt=0.02. This is the "betting phase computes
+    it, racing phase just plays it back" split.
+    """
+
+    def __init__(self, race, playback_speed=1.0):
+        if not race._ran:
+            raise RuntimeError("Race must be run (race.run()) before replay.")
+        super().__init__(race, show_debug_rays=False)
+        self.playback_speed = playback_speed
+        self.total_playback_time = max(
+            (s.history[-1][2] for s in race.states if s.history), default=0.0
+        )
+
+    def draw_horses_at(self, playback_time):
+        from models import interpolate_position
+        for i, s in enumerate(self.race.states):
+            color = self.colours[i % len(self.colours)]
+            pos = interpolate_position(s.history, playback_time)
+            if pos is None:
+                continue
+            x, y = pos
+            px, py = self.world_to_screen(x, y)
+
+            pygame.draw.circle(self.screen, color, (px, py), 8)
+
+            name_surf = self.font_small.render(s.horse.name, True, color)
+            self.screen.blit(name_surf, (px + 10, py - 10))
+
+            time_surf = self.font_small.render(f"{playback_time:.2f}s", True, (200, 200, 200))
+            self.screen.blit(time_surf, (px + 10, py + 5))
+
+    def draw_replay_hud(self, playback_time):
+        finished = playback_time >= self.total_playback_time
+        status = "FINISHED" if finished else "REPLAYING"
+        hud_text = (
+            f"replay t={playback_time:.2f}s / {self.total_playback_time:.2f}s   "
+            f"status={status}   (precomputed at tick_dt={self.race.tick_dt})"
+        )
+        hud_surf = self.font_medium.render(hud_text, True, (220, 220, 220))
+        self.screen.blit(hud_surf, (20, 20))
+
+    def run(self):
+        running = True
+        playback_time = 0.0
+
+        while running:
+            real_dt = self.clock.tick(60) / 1000.0   # smooth 60fps regardless of sim tick_dt
+            playback_time += real_dt * self.playback_speed
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+
+            self.screen.fill((10, 10, 10))
+            self.draw_track()
+            self.draw_horses_at(playback_time)
+            self.draw_replay_hud(playback_time)
+            pygame.display.flip()
+
+        pygame.quit()
