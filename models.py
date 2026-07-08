@@ -1,6 +1,45 @@
 import random
 import math
-from race_track import a_star
+from race_track import (
+    a_star, compute_ray_neighbors, has_immediate_blocker,
+    build_path_reservation, build_projected_reservation,
+)
+
+
+def interpolate_position(history, t):
+    """
+    Given a horse's timestamped history [(x, y, total_time), ...] —
+    always sorted by total_time, since it's built tick by tick — return
+    the interpolated (x, y) position at playback time `t`.
+
+    This is the piece that makes precompute-then-replay work: the race
+    can be simulated once, offline, using whatever tick size is safest
+    for the AI's decisions, and then played back at any frame rate by
+    just asking "where was this horse at time t" — smoothly, with no
+    dependency on how coarse the original simulation ticks were.
+    """
+    if not history:
+        return None
+    if t <= history[0][2]:
+        return history[0][0], history[0][1]
+    if t >= history[-1][2]:
+        return history[-1][0], history[-1][1]
+
+    lo, hi = 0, len(history) - 1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if history[mid][2] <= t:
+            lo = mid
+        else:
+            hi = mid
+
+    x0, y0, t0 = history[lo]
+    x1, y1, t1 = history[hi]
+    if t1 == t0:
+        return x0, y0
+    frac = (t - t0) / (t1 - t0)
+    return x0 + frac * (x1 - x0), y0 + frac * (y1 - y0)
+
 
 # --- Horse & Rider ---
 
@@ -25,42 +64,23 @@ class HorseRuntimeState:
         self.current_stamina = min(100.0, horse.stamina)
         self.total_distance = 0.0
         self.total_time = 0.0
-        self.history = [start_node.get_coordinates()]  # list[(x,y)]
+        self.history = [(start_node.x, start_node.y, 0.0)]  # list[(x, y, total_time)]
         self.finished = False
+        # Candidate lane-change rays from the horse's CURRENT node — list
+        # of (target_node, distance) tuples, same shape compute_ray_neighbors
+        # returns. Computed after the horse's position is finalized for
+        # the tick (see advance_one_tick), so it always matches exactly
+        # where the renderer will draw it from. Purely for the debug
+        # overlay; doesn't affect simulation.
+        self.debug_rays = []
+        self.disabled_lanes = {}  # {lane_index: vacate_time} — lanes currently off-limits for ray casting
 
-class Rider:
-    def __init__(self, name, skill, experience):
-        self.name = name
-        self.skill = skill
-        self.experience = experience
-        self.chemistries = {}  # horse_name: float
 
-
-# --- Team ---
-
-class Team:
-    def __init__(self, name):
-        self.name = name
-        self.riders = []
-        self.horses = []
-        self.selected_pair = None
-        self.performance = 0.0
-        self.position = None
-        self.distance = 0
-        self.finished = False
-
-    def select_for_race(self, rider, horse):
-        self.selected_pair = (rider, horse)
-
-    def calculate_performance(self):
-        if not self.selected_pair:
-            raise ValueError("No rider-horse pair selected for race.")
-        rider, horse = self.selected_pair
-        chemistry_bonus = rider.chemistries.get(horse.name, 0)
-        randomness = random.uniform(-1, 1)  # optional flavor
-        self.performance = horse.base_speed + rider.skill + rider.experience + chemistry_bonus + randomness
-        return self.performance
-
+    def __lt__(self, other):
+        return self.current_speed < other.current_speed
+    
+    def __repr__(self):
+        return f"{self.horse.name}: {self.current_speed:.2f} m/s"
 
 # --- Track Node & Generator ---
 
@@ -209,7 +229,7 @@ class RaceTrack:
 
             # Connect the last node to the super sink
             if previous_node:
-                previous_node.adjacent.append((self.finish_node, 0.1))
+                previous_node.adjacent.append((self.finish_node, 0.0))
 
     def get_lane_coordinates(self, lane_index):
         return list(self.nodes[lane_index].keys())
@@ -230,9 +250,11 @@ class Race:
         self.horses_with_lanes = horses_with_lanes
         self.track = track
 
-        # per tick blockage map
+        # per-lane occupancy: list of (tail_idx, head_idx, distance_from_start,
+        # speed, body_length) tuples, one per horse currently occupying that
+        # lane. Time-aware — see advance_one_tick / a_star's blocking check.
         self.blocked = {
-            lane: [False] * len(track.lane_lists[lane])
+            lane: []
             for lane in track.lane_lists
         }
 
@@ -253,19 +275,72 @@ class Race:
     # ---------- core simulation ----------
 
     def advance_one_tick(self):
-        """Advance all horses by one tick using A* as short-horizon planner."""
+        """Advance all horses by one tick using A* as short-horizon planner.
 
-        # reset blocking for this tick
-        for lane in self.blocked:
-            for i in range(len(self.blocked[lane])):
-                self.blocked[lane][i] = False
+        Movement is computed in two phases so horses are planned
+        simultaneously rather than sequentially:
 
-        for s in self.states:
-            if s.finished:
-                continue
+        1) PLAN: every horse plans against the SAME frozen blocking
+           snapshot — wherever everyone ended up at the end of the
+           PREVIOUS tick. This snapshot is not touched while horses are
+           planning, so whichever horse happens to be first in
+           self.states gets no advantage from "moving" before the
+           others see the board.
+        2) COMMIT: once everyone's move for this tick is known, state is
+           updated and the blocked map is rebuilt from those new final
+           positions, ready for the *next* tick's planning phase.
 
+        (Previously, the blocked map was mutated horse-by-horse inside a
+        single loop, so a horse processed earlier could advance past
+        another horse's start-of-tick position and "leave behind" a
+        blocked tail that the later horse's planner would then dodge —
+        even though the two never actually overlapped in real time.)
+
+        Each occupancy entry also carries the blocking horse's snapshot
+        speed, so a_star can treat it as a MOVING obstacle rather than a
+        wall frozen for the whole tick: a node only counts as blocked for
+        as long as the blocker's body (projected forward at that speed)
+        would still be on top of it. This is what stops a trailing horse
+        from needlessly detouring around a leader who, in reality, will
+        have already moved on by the time the trailing horse gets there.
+        """
+
+        planned = []  # (state, final_node, new_total_time, final_stamina, final_speed)
+
+        # Leaders plan first: the horse physically in front can't be blocked
+        # by anyone behind it, so giving it priority matches reality instead
+        # of introducing an arbitrary ordering bias. "In front" = least
+        # remaining distance to the finish, NOT distance_from_start — outer
+        # lanes are longer, so raw distance_from_start isn't comparable
+        # across lanes.
+        active = [s for s in self.states if not s.finished]
+        active.sort(
+            key=lambda s: self.track.total_distances[s.node.lane] - s.node.distance_from_start
+        )
+
+        # EVERY horse has a reservation at all times this tick. A horse
+        # that hasn't planned yet is covered by a synthetic one — its
+        # start-of-tick position projected at constant speed. As each
+        # horse plans, its estimate is swapped for the exact trajectory.
+        # One blocking mechanism; estimates simply get upgraded to truth
+        # as the loop advances.
+        res_by_horse = {
+            id(s): build_projected_reservation(
+                s.node, s.current_speed, s.horse.length, self.tick_dt
+            )
+            for s in active
+        }
+
+        for s in active:
             horse = s.horse
-            
+
+            # Everyone's reservation except our own
+            reservations = {}
+            for sid, lanes in res_by_horse.items():
+                if sid == id(s):
+                    continue
+                for lane, entry in lanes.items():
+                    reservations.setdefault(lane, []).append(entry)
 
             # Call the new time-based A*
             (
@@ -274,62 +349,141 @@ class Race:
                 new_total_time,
                 final_node,
                 final_speed,
-                final_stamina
+                final_stamina,
+                new_disabled_lanes
             ) = a_star(
                 s.node,
                 self.track.finish_node,
                 self.track,
+                base_speed=horse.base_speed,
                 starting_speed=s.current_speed,
+                base_stamina=horse.stamina,
                 starting_stamina=s.current_stamina,
                 stamina_loss_per_meter=horse.stamina_loss_per_meter,
-                max_time=self.tick_dt,                       # per-tick time budget
-                blocked_map=self.blocked,
-                max_speed_for_heuristic=horse.base_speed,    # or horse.max_speed if you add it
-                initial_total_time=s.total_time
+                max_time=self.tick_dt,
+                initial_total_time=s.total_time,
+                disabled_lanes=dict(s.disabled_lanes),  # pass a copy so a_star can mutate freely
+                reservations=reservations,
+                body_length=horse.length
             )
 
-            print(
-                f"[DEBUG] {horse.name}: "
-                f"path_len={len(path) if path else 0}, "
-                f"tick_time={tick_time:.3f}, "
-                f"total_time={new_total_time:.3f}, "
-                f"final_node={final_node}, "
-                f"final_speed={final_speed:.2f}, "
-                f"final_stamina={final_stamina:.2f}"
-            )
+            if horse.name == "Titan":
+                print(
+                    f"[DEBUG] {horse.name}: "
+                    f"path_len={len(path) if path else 0}, "
+                    f"tick_time={tick_time:.3f}, "
+                    f"total_time={new_total_time:.3f}, "
+                    f"final_node={final_node}, "
+                    f"final_speed={final_speed:.2f}, "
+                    f"final_stamina={final_stamina:.2f}"
+                )
 
-            # Nothing useful planned this tick
+            # Nothing useful planned this tick: the horse stays where it
+            # is, so its synthetic reservation stays in place for later
+            # planners.
             if not path or tick_time <= 0.0 or final_node is None:
                 continue
 
-            # Use the state that A* actually ended at
+            # Upgrade this horse's estimate to its exact tick trajectory —
+            # later planners see where it actually is at each moment of
+            # the tick, not the constant-speed guess.
+            # Held-head (tick_dt) applies only to horses still racing —
+            # commit really does hold them at final_node until tick end.
+            # A FINISHER doesn't park on the line: it gallops through.
+            # Holding its head there leaves a phantom stationary body on
+            # the finish line for the rest of the tick, braking every
+            # horse arriving just behind it. Let a finisher's reservation
+            # keep projecting forward past its crossing time instead.
+            finished_now = final_node is self.track.finish_node
+            
+            res_by_horse[id(s)] = build_path_reservation(
+                self.track, path, horse.length, final_speed,
+                tick_dt=None if finished_now else self.tick_dt
+            )
+
+            planned.append((s, path, s.total_time, final_node, new_total_time, final_stamina, final_speed, new_disabled_lanes))
+
+        # ---- COMMIT phase: apply everyone's move ----
+        planned_ids = set()
+        for s, path, tick_start_time, final_node, new_total_time, final_stamina, final_speed, new_disabled_lanes in planned:
+            planned_ids.add(id(s))
+            for x, y, rel_t in path[1:]:
+                # Clamp to the tick: the same-lane wait loop can overshoot
+                # max_time by a hair before its budget break fires, and an
+                # overshot timestamp lands past the tick-end point appended
+                # below — a microscopic backwards step in the history that
+                # jitters the replay interpolator. Position is kept; the
+                # timestamp just can't leave the tick.
+                s.history.append((x, y, tick_start_time + min(rel_t, self.tick_dt)))
+
             s.node = final_node
-            s.total_time = new_total_time
             s.current_stamina = max(0.0, min(100.0, final_stamina))
             s.current_speed = final_speed
-            s.history.append(s.node.get_coordinates())
+            s.lane = final_node.lane if final_node.lane != -1 else s.lane
+            s.disabled_lanes = new_disabled_lanes
 
-            # If we reached the finish, mark finished and skip blocking logic
+
+            if final_node is not self.track.finish_node:
+                s.total_distance = final_node.distance_from_start
+
             if s.node is self.track.finish_node:
                 s.finished = True
+                # Finish time is the exact moment the line was crossed
+                s.total_time = new_total_time
+            else:
+                # Every horse consumes exactly tick_dt of wall time per
+                # tick, whether A* used its whole budget or not. Without
+                # this, per-tick shortfalls accumulate differently per
+                # horse and their clocks drift apart — the sim's positions
+                # stay honest but replay (which interpolates by wall time)
+                # shows horses several metres from where they really are
+                # relative to each other.
+                s.total_time = tick_start_time + self.tick_dt
+                s.history.append((final_node.x, final_node.y, s.total_time))
+
+        # Horses that planned nothing this tick are standing still — but
+        # standing still consumes wall time like anything else.
+        for s in active:
+            if id(s) not in planned_ids:
+                s.total_time += self.tick_dt
+                s.history.append((s.node.x, s.node.y, s.total_time))
+
+        # ---- Rebuild occupancy from EVERYONE still in the race ----
+        # Same reservation form as planning uses, built from end-of-tick
+        # positions. Only the debug-ray overlay reads this (planning seeds
+        # its own fresh synthetic reservations each tick), but it includes
+        # every unfinished horse — including ones that made zero progress —
+        # so nothing "vanishes" from the overlay's blocking checks.
+        for lane in self.blocked:
+            self.blocked[lane] = []
+
+        for s in self.states:
+            if s.finished:
                 continue
+            for lane, entry in build_projected_reservation(
+                s.node, s.current_speed, s.horse.length, self.tick_dt
+            ).items():
+                self.blocked.setdefault(lane, []).append(entry)
 
-            # BLOCKING LOGIC
-            lane = s.node.lane            
-            node = s.node
-
-            lane_map = self.track.lane_index.get(lane)
-            idx = lane_map.get(node) if lane_map else None
-
-            if idx is None:
+        # ---- DEBUG OVERLAY: candidate rays from where everyone now stands ----
+        # Computed last, after every horse's position AND the rebuilt
+        # blocking map are both final for this tick. Doing this earlier
+        # (e.g. during planning, before positions update) would compute
+        # rays from last tick's position but draw them from this tick's
+        # dot — two different points stitched together, which looks like
+        # a wrong direction even though the underlying ray math is
+        # correct. Uses the exact same gating rule a_star itself uses
+        # internally, so the overlay never shows a ray the planner
+        # wouldn't actually have bothered considering.
+        for s in self.states:
+            if s.finished:
+                s.debug_rays = []
                 continue
-
-            # how many nodes a horse occupies (e.g. 2.4 m / 0.1 spacing ≈ 24 nodes)
-            horse_length_nodes = int(s.horse.length / 0.1)
-
-            tail_idx = max(0, idx - horse_length_nodes)
-            for i in range(tail_idx, idx + 1):
-                self.blocked[lane][i] = True
+            if s.node.lane == 0 and not has_immediate_blocker(s.node, self.blocked, s.current_speed):
+                s.debug_rays = []
+            else:
+                excluded = {lane for lane, t in s.disabled_lanes.items() if s.total_time < t}
+                s.debug_rays = compute_ray_neighbors(self.track, s.node, s.current_speed, excluded_lanes=excluded)
 
 
     def run(self):
@@ -340,6 +494,24 @@ class Race:
             if all(s.finished for s in self.states):
                 break
         self._ran = True
+
+    def play_replay(self, playback_speed=1.0):
+        """
+        Precompute the entire race right now (fast — there's no real-time
+        constraint, so even a very small tick_dt finishes in well under a
+        second), then hand off to a renderer that just interpolates the
+        recorded timestamped history smoothly at whatever frame rate the
+        display wants. The simulation's tick size no longer has any
+        bearing on how smooth this looks — that tradeoff is gone, because
+        "compute the race" and "watch the race" are no longer the same
+        clock. This is the betting-phase-then-racing-phase split: run
+        this once while bets are open, then replay the result live.
+        """
+        if not self._ran:
+            self.run()
+        from renderer import RaceReplayRenderer
+        renderer = RaceReplayRenderer(self, playback_speed=playback_speed)
+        renderer.run()
 
     # ---------- results / standings ----------
 
@@ -381,7 +553,3 @@ class Race:
         renderer = RaceRendererPygame(self)
         renderer.run()
         self._ran = True
-
-
-
-
