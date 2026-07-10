@@ -28,7 +28,7 @@ def triomphe (
     prev = {}
 
     best_remaining = float("inf")
-    # best_heuristic = float("inf")
+    best_heuristic = float("inf")
     best_speed = starting_speed
     best_stamina = starting_stamina
 
@@ -66,6 +66,13 @@ def triomphe (
             best_key = key
             best_speed = current_speed
             best_stamina = current_stamina
+
+        # h_here = heuristic(node, track, round(current_speed, 1), reservations)
+        # if h_here < best_heuristic:
+        #     best_heuristic = h_here
+        #     best_key = key
+        #     best_speed = current_speed
+        #     best_stamina = current_stamina
 
 
         if node == end_node:
@@ -164,6 +171,9 @@ def triomphe (
                                 for r in lane_res
                             )
 
+                        # if blocked or new_time > max_time:
+                        #     continue
+
 
                 else:
                     # LANE CHANGES are strict and at full pace: the merge
@@ -182,7 +192,7 @@ def triomphe (
 
                 
             new_stamina = max(0.0, current_stamina - distance * stamina_loss_per_meter)
-            new_speed = real_speed if speed_reduced else ability_speed
+            new_speed = max(real_speed, 6.0) if speed_reduced else ability_speed
 
             new_key = (neighbor, round(new_speed, 1), get_stamina_state(new_stamina))
 
