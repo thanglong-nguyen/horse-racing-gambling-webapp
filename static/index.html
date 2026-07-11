@@ -3,124 +3,229 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Horse Race Results</title>
+    <title>Horse Race Simulator</title>
     <style>
         body {
             font-family: Arial, sans-serif;
-            margin: 40px;
+            margin: 0;
+            padding: 20px;
             background-color: #f4f4f9;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        h1 {
+            margin-bottom: 10px;
+            color: #1a202c;
+        }
+        .canvas-panel {
+            margin-top: 10px;
+            margin-bottom: 20px;
+        }
+        canvas {
+            background-color: #2e7d32; /* Grass green track infield */
+            border: 4px solid #1b5e20;
+            border-radius: 8px;
+            box-shadow: 0 6px 12px rgba(0,0,0,0.15);
+            display: block;
+        }
+        .controls-panel {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            width: 100%;
+            max-width: 600px;
         }
         button {
-            padding: 10px 20px;
-            font-size: 16px;
+            padding: 14px 40px;
+            font-size: 18px;
             cursor: pointer;
             background-color: #2b6cb0;
             color: white;
             border: none;
-            border-radius: 4px;
-            margin-bottom: 20px;
+            border-radius: 6px;
+            font-weight: bold;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            transition: background-color 0.2s;
         }
-        button:hover {
-            background-color: #1a4971;
+        button:hover { background-color: #1a4971; }
+        #status { 
+            font-weight: bold; 
+            margin-top: 15px;
+            margin-bottom: 25px; 
+            color: #4a5568; 
+            font-size: 16px;
         }
         table {
             width: 100%;
-            max-width: 600px;
             border-collapse: collapse;
             background-color: white;
             box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            border-radius: 4px;
+            overflow: hidden;
         }
         th, td {
             padding: 12px 15px;
             text-align: left;
             border-bottom: 1px solid #e2e8f0;
         }
-        th {
-            background-color: #4a5568;
-            color: white;
-        }
-        tr:nth-child(even) {
-            background-color: #f7fafc;
-        }
-        #status {
-            font-weight: bold;
-            color: #4a5568;
-            margin-bottom: 10px;
-        }
+        th { background-color: #4a5568; color: white; }
+        tr:nth-child(even) { background-color: #f7fafc; }
     </style>
 </head>
 <body>
 
-    <h1>Race Track Leaderboard</h1>
+    <h1>Horse Race Arena</h1>
     
-    <!-- Trigger button -->
-    <button id="run-race-btn">Start Test Race</button>
-    
-    <!-- Status Indicator -->
-    <div id="status">Click the button to run a race.</div>
+    <div class="canvas-panel">
+        <canvas id="race-canvas" width="1200" height="800"></canvas>
+    </div>
 
-    <!-- Table Container -->
-    <table id="results-table" style="display: none;">
-        <thead>
-            <tr>
-                <th>Rank</th>
-                <th>Horse Name</th>
-                <th>Final Time (seconds)</th>
-            </tr>
-        </thead>
-        <tbody id="results-body">
-            <!-- JavaScript will inject rows here -->
-        </tbody>
-    </table>
+    <div class="controls-panel">
+        <button id="run-race-btn">Start Simulation</button>
+        <div id="status">Loading track layout...</div>
 
-    <script>
+        <table id="results-table" style="display: none;">
+            <thead>
+                <tr>
+                    <th>Rank</th>
+                    <th>Horse</th>
+                    <th>Time</th>
+                </tr>
+            </thead>
+            <tbody id="results-body"></tbody>
+        </table>
+    </div>
+
+        <script>
+        const canvas = document.getElementById('race-canvas');
+        const ctx = canvas.getContext('2d');
         const button = document.getElementById('run-race-btn');
         const statusDiv = document.getElementById('status');
         const table = document.getElementById('results-table');
         const tableBody = document.getElementById('results-body');
 
+        // Store lanes as a raw object/dictionary now, matching the API shape
+        let trackLanes = {}; 
+        
+        let SCALE = 1.0;
+        let OFFSET_X = 0;
+        let OFFSET_Y = 0;
+
+        function worldToScreen(wx, wy) {
+            const sx = wx * SCALE + OFFSET_X;
+            const sy = -wy * SCALE + OFFSET_Y;
+            return { x: sx, y: sy };
+        }
+
+        // Compute bounds by iterating through the values of the direct JSON dictionary
+        function calculateTrackBounds() {
+            let xs = [];
+            let ys = [];
+
+            // FIXED: Loop through dictionary values directly using Object.values()
+            Object.values(trackLanes).forEach(polyline => {
+                polyline.forEach(([x, y]) => {
+                    xs.push(x);
+                    ys.push(y);
+                });
+            });
+
+            const min_x = Math.min(...xs);
+            const max_x = Math.max(...xs);
+            const min_y = Math.min(...ys);
+            const max_y = Math.max(...ys);
+
+            const track_width_m = max_x - min_x;
+            const track_height_m = max_y - min_y;
+
+            const scale_x = (canvas.width * 0.9) / track_width_m;
+            const scale_y = (canvas.height * 0.9) / track_height_m;
+
+            SCALE = Math.min(scale_x, scale_y);
+
+            OFFSET_X = canvas.width / 2 - (min_x + track_width_m / 2) * SCALE;
+            OFFSET_Y = canvas.height / 2 + (min_y + track_height_m / 2) * SCALE;
+
+            console.log(`[Renderer] Scale set to: ${SCALE.toFixed(3)} px/m`);
+        }
+
+        async function initTrack() {
+            try {
+                const response = await fetch('/track');
+                if (!response.ok) throw new Error(`HTTP error! Status: ${response.status}`);
+                
+                // FIXED: data IS the dictionary wrapper directly, no .lanes property exists
+                trackLanes = await response.json(); 
+                
+                calculateTrackBounds();
+                statusDiv.textContent = "Track loaded. Ready to race!";
+                drawTrackOnly();
+            } catch (err) {
+                console.error("Error fetching track data:", err);
+                statusDiv.textContent = "Error loading track framework.";
+            }
+        }
+
+        function drawTrackOnly() {
+            ctx.fillStyle = "#2e7d32";
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // FIXED: Use Object.values() to grab and draw each polyline array directly
+            Object.values(trackLanes).forEach(polyline => {
+                if (!polyline || polyline.length === 0) return;
+
+                ctx.beginPath();
+                ctx.lineWidth = 1.5;
+                ctx.strokeStyle = "rgba(255, 255, 255, 0.85)"; 
+
+                const [firstX, firstY] = polyline[0];
+                const startPt = worldToScreen(firstX, firstY);
+                ctx.moveTo(startPt.x, startPt.y);
+
+                for (let i = 1; i < polyline.length; i++) {
+                    const [wx, wy] = polyline[i];
+                    const pt = worldToScreen(wx, wy);
+                    ctx.lineTo(pt.x, pt.y);
+                }
+                
+                ctx.stroke();
+            });
+        }
+
         button.addEventListener('click', async () => {
-            // Update UI state to loading
-            statusDiv.textContent = "Simulating race... please wait.";
+            statusDiv.textContent = "Calculating race physics...";
             table.style.display = 'none';
-            tableBody.innerHTML = ''; 
+            tableBody.innerHTML = '';
 
             try {
-                // 1. Call your own API endpoint
-                // Note: Modified to "/race" to match your randomized endpoint from step 1, 
-                // but you can swap it to "/race/test" if you prefer the static horse stats.
                 const response = await fetch('/race', { method: 'POST' });
-                
-                if (!response.ok) {
-                    throw new Error(`HTTP error! status: ${response.status}`);
-                }
-
-                // 2. Parse the JSON payload
                 const data = await response.json();
                 const results = data.results;
 
-                // 3. Loop through the data and build HTML rows dynamically
+                drawTrackOnly();
+
                 results.forEach((result, index) => {
                     const row = document.createElement('tr');
-                    
                     row.innerHTML = `
                         <td><strong>#${index + 1}</strong></td>
                         <td>${result.horse}</td>
                         <td>${result.final_time.toFixed(2)}s</td>
                     `;
-                    
                     tableBody.appendChild(row);
                 });
 
-                // 4. Show the completed table
-                statusDiv.textContent = "Race finished!";
+                statusDiv.textContent = "Simulation completed.";
                 table.style.display = 'table';
 
             } catch (error) {
-                console.error("Failed to fetch race results:", error);
-                statusDiv.textContent = "Error running the race. Check your terminal or console.";
+                console.error("Failed executing endpoint query:", error);
+                statusDiv.textContent = "Error running race cycle simulation.";
             }
         });
+
+        initTrack();
     </script>
+
 </body>
 </html>
