@@ -27,8 +27,9 @@ def triomphe (
     f_scores = {}
     prev = {}
 
-    best_remaining = float("inf")
+
     best_heuristic = float("inf")
+
     best_speed = starting_speed
     best_stamina = starting_stamina
 
@@ -52,27 +53,13 @@ def triomphe (
         if f_scores.get(key, float("inf")) < f_score:
             continue
 
-        # Track the physically furthest-along node reached within the time
-        # budget. Raw remaining distance, no speed in the comparison: a
-        # speed-scaled heuristic isn't comparable across nodes popped at
-        # different (decayed) speeds, which is what used to pin best_key
-        # to the start node and stall the horse.
-        if node.lane == -1:
-            remaining_here = -1.0
-        else:
-            remaining_here = track.total_distances[node.lane] - node.distance_from_start
-        if remaining_here < best_remaining:
-            best_remaining = remaining_here
+
+        h_here = heuristic(node, track, round(current_speed, 1), reservations)
+        if h_here < best_heuristic:
+            best_heuristic = h_here
             best_key = key
             best_speed = current_speed
             best_stamina = current_stamina
-
-        # h_here = heuristic(node, track, round(current_speed, 1), reservations)
-        # if h_here < best_heuristic:
-        #     best_heuristic = h_here
-        #     best_key = key
-        #     best_speed = current_speed
-        #     best_stamina = current_stamina
 
 
         if node == end_node:
@@ -102,7 +89,14 @@ def triomphe (
 
 
         ray_neighbors = []
-        if node.lane == 0 and not has_immediate_blocker(node, reservations, current_speed):
+        # Speed IS the traffic signal: a state at full (stamina-decayed)
+        # pace has nothing in front of it worth dodging, so lane 0 skips
+        # ray casting. Any follow-reduction marks the state as boxed and
+        # rays get cast. Computed per-state from this state's stamina —
+        # not a shared loop variable, which would leak one branch's value
+        # into another's decision.
+        state_ability = decay_speed(starting_speed, current_stamina, base_stamina)
+        if node.lane == 0 and current_speed >= state_ability - 0.05:
             pass
         else:
             ray_neighbors = compute_ray_neighbors(track, node, current_speed, excluded)
@@ -120,7 +114,7 @@ def triomphe (
             # previous node was a slowed one. Only nodes that are
             # actually blocked get the reduced speed (loop below), so a
             # horse recovers to full pace the instant the road is open.
-            ability_speed = decay_speed(starting_speed, current_stamina, base_stamina)
+            ability_speed = state_ability
             effective_speed = max(ability_speed, 6.0)
             edge_time = distance / effective_speed
             new_time = time_so_far + edge_time
@@ -151,7 +145,7 @@ def triomphe (
                         )
 
                         if blocked:
-                            real_speed = effective_speed_for_heuristic(node, reservations, current_speed)
+                            real_speed = find_real_speed(node, reservations, current_speed)
                             speed_reduced = True
 
                         while blocked:
@@ -171,9 +165,6 @@ def triomphe (
                                 for r in lane_res
                             )
 
-                        # if blocked or new_time > max_time:
-                        #     continue
-
 
                 else:
                     # LANE CHANGES are strict and at full pace: the merge
@@ -192,6 +183,7 @@ def triomphe (
 
                 
             new_stamina = max(0.0, current_stamina - distance * stamina_loss_per_meter)
+
             new_speed = max(real_speed, 6.0) if speed_reduced else ability_speed
 
             new_key = (neighbor, round(new_speed, 1), get_stamina_state(new_stamina))
@@ -319,7 +311,6 @@ def reservation_blocks(reservation, node_dist, t, mover_length=0.0):
 
 
 
-
 def build_projected_reservation(node, speed, body_length, tick_dt):
     """
     Synthetic reservation for a horse that HASN'T planned yet this tick:
@@ -354,7 +345,7 @@ def is_blocking_now(node, reservation, speed_for_arrival):
     return my_arrival_time < t_clear
 
 
-def effective_speed_for_heuristic(node, reservations, max_speed):
+def find_real_speed(node, reservations, max_speed):
     effective_speed = max_speed
     if not reservations:
         return effective_speed
@@ -367,26 +358,14 @@ def effective_speed_for_heuristic(node, reservations, max_speed):
     return effective_speed
 
 
-def would_be_throttled(node, reservations, current_speed):
-    return effective_speed_for_heuristic(node, reservations, current_speed) < current_speed
-
-
-def has_immediate_blocker(node, reservations, current_speed):
-    if not reservations:
-        return False
-    lane_res = reservations.get(node.lane)
-    if not lane_res:
-        return False
-    return any(is_blocking_now(node, reservation, current_speed) for reservation in lane_res)
-
-
 def heuristic(node, track, max_speed, reservations=None):
     if node.lane == -1:
         return 0.0
+    
     total_dist = track.total_distances[node.lane]
     remaining_dist = max(0.0, total_dist - node.distance_from_start)
-    effective_speed = effective_speed_for_heuristic(node, reservations, max_speed)
-    return remaining_dist / effective_speed
+
+    return remaining_dist / max(max_speed, 6.0)
 
 
 def reconstruct_path(prev, best_times, end_key):
