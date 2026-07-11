@@ -7,15 +7,22 @@ from models import (
     Horse, TrackNode, RaceTrack, Race
 )
 
-from pydantic import BaseModel
-from typing import List
+# 1. Import RootModel alongside standard Pydantic tools
+from pydantic import BaseModel, RootModel
+from typing import List, Tuple, Dict
 
-# The schema for an individual horse result
+# --- Pydantic Validation Schemas ---
+
+# 2. FIXED: Define TrackResponse before it is referenced in the route decorator.
+# Maps lane string IDs to an array of [x, y] coordinate tuples.
+class TrackResponse(RootModel):
+    root: Dict[str, List[Tuple[float, float]]]
+
 class HorseResult(BaseModel):
     horse: str
     final_time: float
+    history: List[Tuple[float, float, float]] 
 
-# The schema for the final response payload
 class RaceResponse(BaseModel):
     results: List[HorseResult]
 
@@ -36,20 +43,16 @@ def generate_random_horses(num_lanes=8):
     Generates dynamic horses with stats inside random ranges 
     and randomly assigns them to available track lanes.
     """
-    # 1. Generate horses with randomized stats
     horses = []
     names_pool = random.sample(HORSE_NAMES, min(num_lanes, len(HORSE_NAMES)))
     
     for name in names_pool:
-        # Define your specific attribute ranges here
-        speed = round(random.uniform(20.0, 24.0), 2)          # e.g., 20m/s to 24m/s
-        stamina = random.randint(85, 115)                     # e.g., 85 to 115 stamina points
-        loss_rate = round(random.uniform(0.03, 0.07), 4)      # e.g., 0.03 to 0.07 loss/meter
+        speed = round(random.uniform(20.0, 24.0), 2)          
+        stamina = random.randint(85, 115)                     
+        loss_rate = round(random.uniform(0.03, 0.07), 4)      
         
         horses.append(Horse(name, speed, stamina, loss_rate))
     
-    # 2. Assign horses to lanes completely randomly
-    # Creates a list of available lanes [0, 1, 2, ..., num_lanes-1] and shuffles it
     available_lanes = list(range(num_lanes))
     random.shuffle(available_lanes)
     
@@ -65,12 +68,16 @@ async def lifespan(app: FastAPI):
     print("Building RaceTrack...")
     track, finish = make_track(lanes=8)
 
+    outlines = {
+        str(lane): [[round(n.x, 1), round(n.y, 1)] for n in nodes[::20]]
+        for lane, nodes in track.lane_lists.items()
+    }
+
     assets["track"] = track
     assets["finish"] = finish
-    
+    assets["outlines"] = outlines
+
     yield
-    # FIXED: Clean up ONLY happens on shutdown now. 
-    # Moving this below 'yield' keeps ml_models populated during runtime.
     assets.clear()
 
 app = FastAPI(lifespan=lifespan)
@@ -87,12 +94,14 @@ async def add_process_time_header(request: Request, call_next):
     return response
 
 
+@app.get("/track", response_model=TrackResponse)
+async def get_track_endpoint():
+    return assets["outlines"]
+
 @app.post("/race", response_model=RaceResponse)
 def run_race_endpoint():
-    # Retrieve the globally cached track
     track = assets["track"]
     
-    # Dynamic: Every single request now gets unique horse stats and lane setups
     horses_with_lanes = generate_random_horses(num_lanes=8)
 
     race = Race(track=track, horses_with_lanes=horses_with_lanes, tick_dt=1, total_time=1000)
@@ -100,11 +109,17 @@ def run_race_endpoint():
 
     results = []
     for horse_state in race.states:
+        # deal with DNF horses later if needed, for now just include their history.
+
+        slim = horse_state.history[::10]
+    
+        history = [[round(x, 2), round(y, 2), round(t, 3)] for x, y, t in slim]
+
         results.append({
-            "horse": horse_state.horse.name,
-            "final_time": horse_state.total_time
+            "horse": horse_state.horse.name,    
+            "final_time": horse_state.total_time,
+            "history": history
         })
 
-    results.sort(key=lambda x: x["final_time"])  # Sort by final time for ranking
-
+    results.sort(key=lambda x: x["final_time"])  
     return {"results": results}
