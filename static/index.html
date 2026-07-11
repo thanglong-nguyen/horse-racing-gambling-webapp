@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Horse Race Results</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 40px;
+            background-color: #f4f4f9;
+        }
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+            background-color: #2b6cb0;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            margin-bottom: 20px;
+        }
+        button:hover {
+            background-color: #1a4971;
+        }
+        table {
+            width: 100%;
+            max-width: 600px;
+            border-collapse: collapse;
+            background-color: white;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        th, td {
+            padding: 12px 15px;
+            text-align: left;
+            border-bottom: 1px solid #e2e8f0;
+        }
+        th {
+            background-color: #4a5568;
+            color: white;
+        }
+        tr:nth-child(even) {
+            background-color: #f7fafc;
+        }
+        #status {
+            font-weight: bold;
+            color: #4a5568;
+            margin-bottom: 10px;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>Race Track Leaderboard</h1>
+    
+    <!-- Trigger button -->
+    <button id="run-race-btn">Start Test Race</button>
+    
+    <!-- Status Indicator -->
+    <div id="status">Click the button to run a race.</div>
+
+    <!-- Table Container -->
+    <table id="results-table" style="display: none;">
+        <thead>
+            <tr>
+                <th>Rank</th>
+                <th>Horse Name</th>
+                <th>Final Time (seconds)</th>
+            </tr>
+        </thead>
+        <tbody id="results-body">
+            <!-- JavaScript will inject rows here -->
+        </tbody>
+    </table>
+
+    <script>
+        const button = document.getElementById('run-race-btn');
+        const statusDiv = document.getElementById('status');
+        const table = document.getElementById('results-table');
+        const tableBody = document.getElementById('results-body');
+
+        button.addEventListener('click', async () => {
+            // Update UI state to loading
+            statusDiv.textContent = "Simulating race... please wait.";
+            table.style.display = 'none';
+            tableBody.innerHTML = ''; 
+
+            try {
+                // 1. Call your own API endpoint
+                // Note: Modified to "/race" to match your randomized endpoint from step 1, 
+                // but you can swap it to "/race/test" if you prefer the static horse stats.
+                const response = await fetch('/race', { method: 'POST' });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                // 2. Parse the JSON payload
+                const data = await response.json();
+                const results = data.results;
+
+                // 3. Loop through the data and build HTML rows dynamically
+                results.forEach((result, index) => {
+                    const row = document.createElement('tr');
+                    
+                    row.innerHTML = `
+                        <td><strong>#${index + 1}</strong></td>
+                        <td>${result.horse}</td>
+                        <td>${result.final_time.toFixed(2)}s</td>
+                    `;
+                    
+                    tableBody.appendChild(row);
+                });
+
+                // 4. Show the completed table
+                statusDiv.textContent = "Race finished!";
+                table.style.display = 'table';
+
+            } catch (error) {
+                console.error("Failed to fetch race results:", error);
+                statusDiv.textContent = "Error running the race. Check your terminal or console.";
+            }
+        });
+    </script>
+</body>
+</html>
