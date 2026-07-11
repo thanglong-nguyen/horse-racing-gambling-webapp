@@ -3,6 +3,7 @@ import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles 
+from fastapi.middleware.gzip import GZipMiddleware
 from models import (
     Horse, TrackNode, RaceTrack, Race
 )
@@ -13,8 +14,6 @@ from typing import List, Tuple, Dict
 
 # --- Pydantic Validation Schemas ---
 
-# 2. FIXED: Define TrackResponse before it is referenced in the route decorator.
-# Maps lane string IDs to an array of [x, y] coordinate tuples.
 class TrackResponse(RootModel):
     root: Dict[str, List[Tuple[float, float]]]
 
@@ -84,6 +83,8 @@ app = FastAPI(lifespan=lifespan)
 
 app.mount("/static", StaticFiles(directory="static", html=True), name="static")
 
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
 # Middleware to measure "before and after" automatically
 @app.middleware("http")
 async def add_process_time_header(request: Request, call_next):
@@ -112,7 +113,9 @@ def run_race_endpoint():
         # deal with DNF horses later if needed, for now just include their history.
 
         slim = horse_state.history[::10]
-    
+        if slim[-1] != horse_state.history[-1]:
+            slim.append(horse_state.history[-1])
+            
         history = [[round(x, 2), round(y, 2), round(t, 3)] for x, y, t in slim]
 
         results.append({
