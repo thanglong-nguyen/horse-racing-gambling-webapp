@@ -98,6 +98,8 @@
     </div>
 
         <script>
+        'use strict';
+
         const canvas = document.getElementById('race-canvas');
         const ctx = canvas.getContext('2d');
         const button = document.getElementById('run-race-btn');
@@ -105,7 +107,7 @@
         const table = document.getElementById('results-table');
         const tableBody = document.getElementById('results-body');
 
-        // Store lanes as a raw object/dictionary now, matching the API shape
+
         let trackLanes = {}; 
         
         let SCALE = 1.0;
@@ -171,7 +173,6 @@
             ctx.fillStyle = "#2e7d32";
             ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-            // FIXED: Use Object.values() to grab and draw each polyline array directly
             Object.values(trackLanes).forEach(polyline => {
                 if (!polyline || polyline.length === 0) return;
 
@@ -189,38 +190,138 @@
                     ctx.lineTo(pt.x, pt.y);
                 }
                 
+                ctx.closePath();
                 ctx.stroke();
             });
         }
 
+                // ============ replay state ============
+        const HORSE_COLORS = ["#e53e3e", "#3182ce", "#38a169", "#dd6b20",
+                            "#805ad5", "#00b5d8", "#d69e2e", "#ed64a6"];
+
+        let raceResults = null;    // the results array from the last /race response
+        let raceStart   = null;    // ms timestamp of the frame the replay began
+        let maxFinishTime = 0;     // when the replay is over (slowest horse)
+
+        function interpolate(history, t) {
+            if (!history || history.length === 0) return null;
+
+            if (t <= history[0][2]) {
+                return [history[0][0], history[0][1]]; 
+            }
+
+            if (t >= history[history.length-1][2]) {
+                return [history[history.length-1][0], history[history.length-1][1]];
+            }
+
+            let lo = 0;
+            let hi = history.length - 1;
+            while (hi - lo > 1) 
+            {
+                const mid = Math.floor((lo + hi) / 2);
+                if (history[mid][2] <= t) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+
+            const [x0, y0, t0] = history[lo];
+            const [x1, y1, t1] = history[hi];
+
+            if (t1 === t0) 
+            {
+                return [x0, y0];
+            }
+
+
+            const frac = (t - t0) / (t1 - t0)
+            return [x0 + frac * (x1 - x0), y0 + frac * (y1 - y0)]
+        }
+
+        function drawHorses(playbackTime) {
+            raceResults.forEach((result, i) => {
+
+                const pos = interpolate(result.history, playbackTime);
+                if (pos === null) {
+                    return;
+                }
+
+                const [x, y] = pos;
+                const pt = worldToScreen(x, y);
+
+                ctx.beginPath();
+                ctx.arc(pt.x, pt.y, 6, 0, Math.PI * 2);   // a 6px dot
+                ctx.fillStyle = HORSE_COLORS[i % HORSE_COLORS.length];
+                ctx.fill();
+
+                // Then the name label next to the dot:
+                ctx.fillStyle = "white";
+                ctx.font = "12px Arial";
+                ctx.fillText(result.horse, pt.x + 9, pt.y - 9);
+            });
+        }
+
+        function buildResultsTable(results) {
+            tableBody.innerHTML = ''; // Clear previous results
+            results.forEach((result, index) => {
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td><strong>#${index + 1}</strong></td>
+                    <td>${result.horse}</td>
+                    <td>${result.final_time.toFixed(2)}s</td>
+                `;
+                tableBody.appendChild(row);
+            });
+        }
+
+        function frame(now) {
+            if (raceStart === null) raceStart = now;
+            const playbackTime = (now - raceStart) / 1000;
+
+            drawTrackOnly();
+            drawHorses(playbackTime);
+
+            if (playbackTime <= maxFinishTime) {
+                requestAnimationFrame(frame);        // race still running → next frame
+            } else {
+                buildResultsTable(raceResults);
+                statusDiv.textContent = "Race completed! The results are shown below.";
+                table.style.display = 'table';
+                animating = false; 
+                button.disabled = false;
+            }
+        }
+
+        function startReplay(results) {
+            raceResults = results;
+            raceStart = null;
+            // TODO: maxFinishTime = the largest final_time in results.
+            //       (results is already sorted — where does the largest one live?)
+            maxFinishTime = results[results.length - 1].final_time;
+            requestAnimationFrame(frame);
+        }
+
+        let animating = false;
+
         button.addEventListener('click', async () => {
-            statusDiv.textContent = "Calculating race physics...";
+            if (animating) return;
+            animating = true;
+            button.disabled = true;  
+
+            statusDiv.textContent = "Simulating...";
             table.style.display = 'none';
             tableBody.innerHTML = '';
-
             try {
                 const response = await fetch('/race', { method: 'POST' });
                 const data = await response.json();
-                const results = data.results;
-
-                drawTrackOnly();
-
-                results.forEach((result, index) => {
-                    const row = document.createElement('tr');
-                    row.innerHTML = `
-                        <td><strong>#${index + 1}</strong></td>
-                        <td>${result.horse}</td>
-                        <td>${result.final_time.toFixed(2)}s</td>
-                    `;
-                    tableBody.appendChild(row);
-                });
-
-                statusDiv.textContent = "Simulation completed.";
-                table.style.display = 'table';
-
+                statusDiv.textContent = "And they're off!";
+                startReplay(data.results);
             } catch (error) {
-                console.error("Failed executing endpoint query:", error);
-                statusDiv.textContent = "Error running race cycle simulation.";
+                console.error(error);
+                statusDiv.textContent = "Error running race.";
+                animating = false; 
+                button.disabled = false;
             }
         });
 
