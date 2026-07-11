@@ -2,12 +2,25 @@ import random
 import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
+from fastapi.staticfiles import StaticFiles 
 from models import (
     Horse, TrackNode, RaceTrack, Race
 )
 
+from pydantic import BaseModel
+from typing import List
+
+# The schema for an individual horse result
+class HorseResult(BaseModel):
+    horse: str
+    final_time: float
+
+# The schema for the final response payload
+class RaceResponse(BaseModel):
+    results: List[HorseResult]
+
 # State container for the immutable track
-ml_models = {}
+assets = {}
 
 def make_track(straight=100, radius=20, lanes=8):
     finish = TrackNode(15, 0, -1, "Finish")
@@ -52,15 +65,17 @@ async def lifespan(app: FastAPI):
     print("Building RaceTrack...")
     track, finish = make_track(lanes=8)
 
-    ml_models["track"] = track
-    ml_models["finish"] = finish
+    assets["track"] = track
+    assets["finish"] = finish
     
     yield
     # FIXED: Clean up ONLY happens on shutdown now. 
     # Moving this below 'yield' keeps ml_models populated during runtime.
-    ml_models.clear()
+    assets.clear()
 
 app = FastAPI(lifespan=lifespan)
+
+app.mount("/static", StaticFiles(directory="static", html=True), name="static")
 
 # Middleware to measure "before and after" automatically
 @app.middleware("http")
@@ -72,10 +87,10 @@ async def add_process_time_header(request: Request, call_next):
     return response
 
 
-@app.post("/race")
-async def run_race_endpoint():
+@app.post("/race", response_model=RaceResponse)
+def run_race_endpoint():
     # Retrieve the globally cached track
-    track = ml_models["track"]
+    track = assets["track"]
     
     # Dynamic: Every single request now gets unique horse stats and lane setups
     horses_with_lanes = generate_random_horses(num_lanes=8)
@@ -92,4 +107,4 @@ async def run_race_endpoint():
 
     results.sort(key=lambda x: x["final_time"])  # Sort by final time for ranking
 
-    return {"placements": results}
+    return {"results": results}
