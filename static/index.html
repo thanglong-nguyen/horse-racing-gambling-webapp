@@ -82,7 +82,6 @@
     </div>
 
     <div class="controls-panel">
-        <button id="run-race-btn">Start Simulation</button>
         <div id="status">Loading track layout...</div>
 
         <table id="results-table" style="display: none;">
@@ -102,7 +101,6 @@
 
         const canvas = document.getElementById('race-canvas');
         const ctx = canvas.getContext('2d');
-        const button = document.getElementById('run-race-btn');
         const statusDiv = document.getElementById('status');
         const table = document.getElementById('results-table');
         const tableBody = document.getElementById('results-body');
@@ -125,7 +123,6 @@
             let xs = [];
             let ys = [];
 
-            // FIXED: Loop through dictionary values directly using Object.values()
             Object.values(trackLanes).forEach(polyline => {
                 polyline.forEach(([x, y]) => {
                     xs.push(x);
@@ -157,7 +154,6 @@
                 const response = await fetch('/track');
                 if (!response.ok) throw new Error(`HTTP error! Status: ${response.status}`);
                 
-                // FIXED: data IS the dictionary wrapper directly, no .lanes property exists
                 trackLanes = await response.json(); 
                 
                 calculateTrackBounds();
@@ -264,15 +260,29 @@
 
         function buildResultsTable(results) {
             tableBody.innerHTML = ''; // Clear previous results
+
+            const headRow = table.querySelector("thead tr");
+            headRow.innerHTML = `<th>Place</th><th>Horse</th><th>Total Time</th>`;
+
             results.forEach((result, index) => {
+                // Find the original horse to get its lane and color index
+                const originalHorseIdx = currentRaceHorses.findIndex(h => h.name === result.horse);
+                const laneNumber = originalHorseIdx !== -1 ? currentRaceHorses[originalHorseIdx].lane : "?";
+                const horseColor = originalHorseIdx !== -1 ? HORSE_COLORS[originalHorseIdx % HORSE_COLORS.length] : "#718096";
+
                 const row = document.createElement('tr');
                 row.innerHTML = `
                     <td><strong>#${index + 1}</strong></td>
-                    <td>${result.horse}</td>
+                    <td>
+                        <span style="display:inline-block; width:12px; height:12px; background:${horseColor}; border-radius:50%; margin-right:8px; vertical-align:middle;"></span>
+                        <strong>${result.horse}</strong>
+                    </td>
                     <td>${result.final_time.toFixed(2)}s</td>
                 `;
                 tableBody.appendChild(row);
             });
+
+            table.style.display = "table";
         }
 
         function frame(now) {
@@ -287,45 +297,109 @@
             } else {
                 buildResultsTable(raceResults);
                 statusDiv.textContent = "Race completed! The results are shown below.";
-                table.style.display = 'table';
-                animating = false; 
-                button.disabled = false;
+
+                setTimeout(lifecycleLoop, 5000);
             }
         }
 
         function startReplay(results) {
             raceResults = results;
             raceStart = null;
-            // TODO: maxFinishTime = the largest final_time in results.
-            //       (results is already sorted — where does the largest one live?)
             maxFinishTime = results[results.length - 1].final_time;
             requestAnimationFrame(frame);
         }
 
-        let animating = false;
 
-        button.addEventListener('click', async () => {
-            if (animating) return;
-            animating = true;
-            button.disabled = true;  
+                // ============ lifecycle state ============
+        let currentRaceId = null;
+        let currentRaceHorses = []; // Added to store horse details for color cross-referencing
 
-            statusDiv.textContent = "Simulating...";
-            table.style.display = 'none';
-            tableBody.innerHTML = '';
+        async function lifecycleLoop() {
             try {
-                const response = await fetch('/race', { method: 'POST' });
-                const data = await response.json();
-                statusDiv.textContent = "And they're off!";
-                startReplay(data.results);
-            } catch (error) {
-                console.error(error);
-                statusDiv.textContent = "Error running race.";
-                animating = false; 
-                button.disabled = false;
+                const resp = await fetch('/race/current');
+
+                if (resp.status === 404) {
+                    statusDiv.textContent = "Next race starting soon...";                    
+                    setTimeout(lifecycleLoop, 2000);
+                    return;
+                }
+
+                const race = await resp.json();
+                currentRaceId = race.race_id;
+                currentRaceHorses = race.horses;
+
+                table.style.display = "table";
+                const headRow = table.querySelector("thead tr");
+                headRow.innerHTML = `<th>Lane</th><th>Horse Spec Sheet</th><th>Current Payout Odds</th>`;
+                
+                tableBody.innerHTML = race.horses.map((horse, idx) => `
+                    <tr>
+                        <td>
+                            <span style="display:inline-block; width:12px; height:12px; background:${HORSE_COLORS[idx % HORSE_COLORS.length]}; border-radius:50%; margin-right:5px; vertical-align:middle;"></span>
+                            Lane ${horse.lane}
+                        </td>
+                        <td><strong>${horse.name}</strong> (Spd: ${horse.base_speed} | Stm: ${horse.stamina})</td>
+                        <td>${horse.odds.toFixed(1)}x</td>
+                    </tr>
+                `).join('');
+
+
+                startCountdown(race.seconds_left);   // hands off; countdown calls back
+
+            } catch (err) {
+                console.error("[Lifecycle Error]:", err);
+                statusDiv.textContent = "Arena connection error. Retrying in 3s...";
+                setTimeout(lifecycleLoop, 3000);
             }
-        });
+        }
+
+        function startCountdown(secondsLeft) {
+            const startedAt = performance.now();     // duration-measuring clock
+            function tick() {
+                const elapsed = (performance.now() - startedAt) / 1000;
+                const left = secondsLeft - elapsed;
+                if (left > 0) {
+                    statusDiv.textContent = `Betting closes in ${left.toFixed(0)}s`;
+                    setTimeout(tick,250);
+
+                } else {
+                    statusDiv.textContent = "Betting closed";
+                    pollForReplay();
+                }
+            }
+            tick();
+        }
+
+        async function pollForReplay() {
+            try {
+
+                const resp = await fetch(`/race/${currentRaceId}/replay`);
+
+                if (resp.status === 425) {
+                    setTimeout(pollForReplay,1000);
+                    return 
+                }
+
+                if (resp.status === 404) {
+                    lifecycleLoop();
+                    return 
+                }
+
+                if (resp.status === 200) {
+                    const data = await resp.json();
+                    startReplay(data.results)
+                }
+
+            } catch (err) {
+                console.error("[Poll for Replay Error]:", err);
+                statusDiv.textContent = "Arena connection error. Retrying in 3s...";
+                setTimeout(pollForReplay, 3000);
+            }
+        }
 
         initTrack();
+        lifecycleLoop();
+
     </script>
 
 </body>
