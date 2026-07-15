@@ -3,6 +3,7 @@ import json
 import random
 import secrets
 import time
+import sqlite3
 from contextlib import asynccontextmanager
 from typing import Dict, List, Tuple
 
@@ -310,3 +311,153 @@ def get_replay(race_id: int):
         return json.loads(race["result_json"])
     finally:
         conn.close()
+
+
+STARTING_BALANCE = 1000.0
+
+class PlayerCreate(BaseModel):
+    name: str
+
+class PlayerResponse(BaseModel):
+    player_id: int
+    name: str
+    token: str        # returned ONCE, at creation. Never again.
+    balance: float
+
+@app.post("/player", response_model=PlayerResponse)
+def create_player(body: PlayerCreate):
+    token = secrets.token_hex(16)     # same module as race seeds — why not random?
+    conn = get_db()
+    try:
+        # INSERT the player. Two things to handle:
+        # 1. name is UNIQUE — a duplicate raises sqlite3.IntegrityError.
+        #    Catch it and raise HTTPException(409, "Name taken").
+        # 2. use cursor.lastrowid for player_id, like in the scheduler.
+        
+        # 1. Attempt to insert the new player using parameterized queries
+
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO players (name, token, balance) VALUES (?, ?, ?)",
+            (body.name, token, STARTING_BALANCE)
+        )
+        conn.commit()
+        
+        player_id = cursor.lastrowid
+        
+        return {
+            "player_id": player_id,
+            "name": body.name,
+            "token": token,
+            "balance" : STARTING_BALANCE
+        }
+        
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        raise HTTPException(status_code=409, detail="Name taken")
+        
+    finally:
+        conn.close()
+
+class BetRequest(BaseModel):
+    token: str       
+    race_id: int
+    lane: int
+    amount: float
+
+@app.post("/bet")
+def place_bet(body: BetRequest):
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+
+        # 1. amount > 0
+        if body.amount <= 0:
+            raise HTTPException(status_code=400, detail="Bet amount must be positive")
+
+        # 2. token -> player row
+        cursor.execute(
+            "SELECT id FROM players WHERE token = ?",
+            (body.token,)
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise HTTPException(status_code=401, detail="Unknown token")
+
+        player_id = row[0]
+
+        # 3. race exists AND status='betting' AND betting_closes_at > now
+        cursor.execute(
+            "SELECT status, betting_closes_at FROM races WHERE id = ?",
+            (body.race_id,)
+        )
+        race = cursor.fetchone()
+        if race is None:
+            raise HTTPException(status_code=404, detail="Race does not exist")
+
+        status, closes_at = race
+        now = time.time()
+
+        if status != "betting" or closes_at <= now:
+            raise HTTPException(status_code=409, detail="Betting closed")
+
+        # 4. lane exists in race_horses for this race
+        cursor.execute(
+            """
+            SELECT odds
+            FROM race_horses
+            WHERE race_id = ? AND lane = ?
+            """,
+            (body.race_id, body.lane)
+        )
+        horse_row = cursor.fetchone()
+        if horse_row is None:
+            raise HTTPException(status_code=404, detail="Lane not found")
+
+        odds = horse_row[0]
+
+        # 5+6. Atomic balance check + subtraction
+        try:
+            cursor.execute(
+                """
+                UPDATE players
+                SET balance = balance - ?
+                WHERE id = ? AND balance >= ?
+                """,
+                (body.amount, player_id, body.amount)
+            )
+
+            if cursor.rowcount == 0:
+                conn.rollback()
+                raise HTTPException(status_code=402, detail="Insufficient funds")
+
+            # Insert bet
+            cursor.execute(
+                """
+                INSERT INTO bets (race_id, player_id, lane, amount, odds, settled)
+                VALUES (?, ?, ?, ?, ?, 0)
+                """,
+                (body.race_id, player_id, body.lane, body.amount, odds)
+            )
+
+            bet_id = cursor.lastrowid
+
+            conn.commit()
+
+        except Exception:
+            conn.rollback()
+            raise
+
+        # Re-select fresh balance (never trust stale Python-side value)
+        cursor.execute("SELECT balance FROM players WHERE id = ?", (player_id,))
+        new_balance = cursor.fetchone()[0]
+
+        return {
+            "bet_id": bet_id,
+            "new_balance": new_balance
+        }
+
+    finally:
+        conn.close()
+
+
