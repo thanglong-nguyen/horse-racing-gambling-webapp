@@ -36,24 +36,11 @@
             width: 100%;
             max-width: 600px;
         }
-        button {
-            padding: 14px 40px;
-            font-size: 18px;
-            cursor: pointer;
-            background-color: #2b6cb0;
-            color: white;
-            border: none;
-            border-radius: 6px;
+        #status {
             font-weight: bold;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-            transition: background-color 0.2s;
-        }
-        button:hover { background-color: #1a4971; }
-        #status { 
-            font-weight: bold; 
             margin-top: 15px;
-            margin-bottom: 25px; 
-            color: #4a5568; 
+            margin-bottom: 25px;
+            color: #4a5568;
             font-size: 16px;
         }
         table {
@@ -76,7 +63,7 @@
 <body>
 
     <h1>Horse Race Arena</h1>
-    
+
     <div class="canvas-panel">
         <canvas id="race-canvas" width="1200" height="800"></canvas>
     </div>
@@ -85,44 +72,51 @@
         <div id="status">Loading track layout...</div>
 
         <table id="results-table" style="display: none;">
-            <thead>
-                <tr>
-                    <th>Rank</th>
-                    <th>Horse</th>
-                    <th>Time</th>
-                </tr>
-            </thead>
+            <thead><tr></tr></thead>
             <tbody id="results-body"></tbody>
         </table>
     </div>
 
-        <script>
+    <script>
         'use strict';
 
+        // ================= DOM handles =================
         const canvas = document.getElementById('race-canvas');
         const ctx = canvas.getContext('2d');
         const statusDiv = document.getElementById('status');
         const table = document.getElementById('results-table');
+        const tableHeadRow = table.querySelector('thead tr');
         const tableBody = document.getElementById('results-body');
 
+        // ================= colors =================
+        // Every renderer colors by LANE — the one identity that never
+        // changes across betting table, canvas, and results table.
+        const HORSE_COLORS = ["#e53e3e", "#3182ce", "#38a169", "#dd6b20",
+                              "#805ad5", "#00b5d8", "#d69e2e", "#ed64a6"];
 
-        let trackLanes = {}; 
-        
+        function colorForLane(lane) {
+            return HORSE_COLORS[lane % HORSE_COLORS.length];
+        }
+
+        function colorDot(lane) {
+            return `<span style="display:inline-block; width:12px; height:12px;
+                background:${colorForLane(lane)}; border-radius:50%;
+                margin-right:8px; vertical-align:middle;"></span>`;
+        }
+
+        // ================= track rendering =================
+        let trackLanes = {};
         let SCALE = 1.0;
         let OFFSET_X = 0;
         let OFFSET_Y = 0;
 
         function worldToScreen(wx, wy) {
-            const sx = wx * SCALE + OFFSET_X;
-            const sy = -wy * SCALE + OFFSET_Y;
-            return { x: sx, y: sy };
+            return { x: wx * SCALE + OFFSET_X, y: -wy * SCALE + OFFSET_Y };
         }
 
-        // Compute bounds by iterating through the values of the direct JSON dictionary
         function calculateTrackBounds() {
-            let xs = [];
-            let ys = [];
-
+            const xs = [];
+            const ys = [];
             Object.values(trackLanes).forEach(polyline => {
                 polyline.forEach(([x, y]) => {
                     xs.push(x);
@@ -138,10 +132,8 @@
             const track_width_m = max_x - min_x;
             const track_height_m = max_y - min_y;
 
-            const scale_x = (canvas.width * 0.9) / track_width_m;
-            const scale_y = (canvas.height * 0.9) / track_height_m;
-
-            SCALE = Math.min(scale_x, scale_y);
+            SCALE = Math.min((canvas.width * 0.9) / track_width_m,
+                             (canvas.height * 0.9) / track_height_m);
 
             OFFSET_X = canvas.width / 2 - (min_x + track_width_m / 2) * SCALE;
             OFFSET_Y = canvas.height / 2 + (min_y + track_height_m / 2) * SCALE;
@@ -151,14 +143,13 @@
 
         async function initTrack() {
             try {
-                const response = await fetch('/track');
-                if (!response.ok) throw new Error(`HTTP error! Status: ${response.status}`);
-                
-                trackLanes = await response.json(); 
-                
+                const resp = await fetch('/track');
+                if (!resp.ok) throw new Error(`HTTP error! Status: ${resp.status}`);
+
+                trackLanes = await resp.json();
                 calculateTrackBounds();
-                statusDiv.textContent = "Track loaded. Ready to race!";
                 drawTrackOnly();
+                statusDiv.textContent = "Track loaded. Ready to race!";
             } catch (err) {
                 console.error("Error fetching track data:", err);
                 statusDiv.textContent = "Error loading track framework.";
@@ -174,46 +165,37 @@
 
                 ctx.beginPath();
                 ctx.lineWidth = 1.5;
-                ctx.strokeStyle = "rgba(255, 255, 255, 0.85)"; 
+                ctx.strokeStyle = "rgba(255, 255, 255, 0.85)";
 
-                const [firstX, firstY] = polyline[0];
-                const startPt = worldToScreen(firstX, firstY);
-                ctx.moveTo(startPt.x, startPt.y);
-
+                const start = worldToScreen(polyline[0][0], polyline[0][1]);
+                ctx.moveTo(start.x, start.y);
                 for (let i = 1; i < polyline.length; i++) {
-                    const [wx, wy] = polyline[i];
-                    const pt = worldToScreen(wx, wy);
+                    const pt = worldToScreen(polyline[i][0], polyline[i][1]);
                     ctx.lineTo(pt.x, pt.y);
                 }
-                
-                ctx.closePath();
+                ctx.closePath();   // lanes are loops — seal the seam
                 ctx.stroke();
             });
         }
 
-                // ============ replay state ============
-        const HORSE_COLORS = ["#e53e3e", "#3182ce", "#38a169", "#dd6b20",
-                            "#805ad5", "#00b5d8", "#d69e2e", "#ed64a6"];
-
-        let raceResults = null;    // the results array from the last /race response
-        let raceStart   = null;    // ms timestamp of the frame the replay began
-        let maxFinishTime = 0;     // when the replay is over (slowest horse)
+        // ================= replay =================
+        let raceResults = null;    // results array from /race/{id}/replay
+        let raceStart = null;      // ms timestamp of the first replay frame
+        let maxFinishTime = 0;     // replay ends when the slowest horse finishes
 
         function interpolate(history, t) {
             if (!history || history.length === 0) return null;
 
             if (t <= history[0][2]) {
-                return [history[0][0], history[0][1]]; 
+                return [history[0][0], history[0][1]];
             }
-
-            if (t >= history[history.length-1][2]) {
-                return [history[history.length-1][0], history[history.length-1][1]];
+            if (t >= history[history.length - 1][2]) {
+                return [history[history.length - 1][0], history[history.length - 1][1]];
             }
 
             let lo = 0;
             let hi = history.length - 1;
-            while (hi - lo > 1) 
-            {
+            while (hi - lo > 1) {
                 const mid = Math.floor((lo + hi) / 2);
                 if (history[mid][2] <= t) {
                     lo = mid;
@@ -224,65 +206,28 @@
 
             const [x0, y0, t0] = history[lo];
             const [x1, y1, t1] = history[hi];
+            if (t1 === t0) return [x0, y0];
 
-            if (t1 === t0) 
-            {
-                return [x0, y0];
-            }
-
-
-            const frac = (t - t0) / (t1 - t0)
-            return [x0 + frac * (x1 - x0), y0 + frac * (y1 - y0)]
+            const frac = (t - t0) / (t1 - t0);
+            return [x0 + frac * (x1 - x0), y0 + frac * (y1 - y0)];
         }
 
         function drawHorses(playbackTime) {
-            raceResults.forEach((result, i) => {
-
+            raceResults.forEach(result => {
                 const pos = interpolate(result.history, playbackTime);
-                if (pos === null) {
-                    return;
-                }
+                if (pos === null) return;
 
-                const [x, y] = pos;
-                const pt = worldToScreen(x, y);
+                const pt = worldToScreen(pos[0], pos[1]);
 
                 ctx.beginPath();
-                ctx.arc(pt.x, pt.y, 6, 0, Math.PI * 2);   // a 6px dot
-                ctx.fillStyle = HORSE_COLORS[i % HORSE_COLORS.length];
+                ctx.arc(pt.x, pt.y, 6, 0, Math.PI * 2);
+                ctx.fillStyle = colorForLane(result.lane);
                 ctx.fill();
 
-                // Then the name label next to the dot:
                 ctx.fillStyle = "white";
                 ctx.font = "12px Arial";
                 ctx.fillText(result.horse, pt.x + 9, pt.y - 9);
             });
-        }
-
-        function buildResultsTable(results) {
-            tableBody.innerHTML = ''; // Clear previous results
-
-            const headRow = table.querySelector("thead tr");
-            headRow.innerHTML = `<th>Place</th><th>Horse</th><th>Total Time</th>`;
-
-            results.forEach((result, index) => {
-                // Find the original horse to get its lane and color index
-                const originalHorseIdx = currentRaceHorses.findIndex(h => h.name === result.horse);
-                const laneNumber = originalHorseIdx !== -1 ? currentRaceHorses[originalHorseIdx].lane : "?";
-                const horseColor = originalHorseIdx !== -1 ? HORSE_COLORS[originalHorseIdx % HORSE_COLORS.length] : "#718096";
-
-                const row = document.createElement('tr');
-                row.innerHTML = `
-                    <td><strong>#${index + 1}</strong></td>
-                    <td>
-                        <span style="display:inline-block; width:12px; height:12px; background:${horseColor}; border-radius:50%; margin-right:8px; vertical-align:middle;"></span>
-                        <strong>${result.horse}</strong>
-                    </td>
-                    <td>${result.final_time.toFixed(2)}s</td>
-                `;
-                tableBody.appendChild(row);
-            });
-
-            table.style.display = "table";
         }
 
         function frame(now) {
@@ -293,11 +238,10 @@
             drawHorses(playbackTime);
 
             if (playbackTime <= maxFinishTime) {
-                requestAnimationFrame(frame);        // race still running → next frame
+                requestAnimationFrame(frame);
             } else {
                 buildResultsTable(raceResults);
                 statusDiv.textContent = "Race completed! The results are shown below.";
-
                 setTimeout(lifecycleLoop, 5000);
             }
         }
@@ -309,43 +253,49 @@
             requestAnimationFrame(frame);
         }
 
+        // ================= tables =================
+        function buildResultsTable(results) {
+            tableHeadRow.innerHTML = `<th>Place</th><th>Horse</th><th>Total Time</th>`;
+            tableBody.innerHTML = results.map((result, index) => `
+                <tr>
+                    <td><strong>#${index + 1}</strong></td>
+                    <td>${colorDot(result.lane)}<strong>${result.horse}</strong></td>
+                    <td>${result.final_time.toFixed(2)}s</td>
+                </tr>
+            `).join('');
+            table.style.display = "table";
+        }
 
-                // ============ lifecycle state ============
+        function buildBettingTable(horses) {
+            tableHeadRow.innerHTML = `<th>Lane</th><th>Horse Spec Sheet</th><th>Current Payout Odds</th>`;
+            tableBody.innerHTML = horses.map(horse => `
+                <tr>
+                    <td>${colorDot(horse.lane)}Lane ${horse.lane}</td>
+                    <td><strong>${horse.name}</strong> (Spd: ${horse.base_speed} | Stm: ${horse.stamina})</td>
+                    <td>${horse.odds.toFixed(1)}x</td>
+                </tr>
+            `).join('');
+            table.style.display = "table";
+        }
+
+        // ================= lifecycle =================
         let currentRaceId = null;
-        let currentRaceHorses = []; // Added to store horse details for color cross-referencing
 
         async function lifecycleLoop() {
             try {
                 const resp = await fetch('/race/current');
 
                 if (resp.status === 404) {
-                    statusDiv.textContent = "Next race starting soon...";                    
+                    statusDiv.textContent = "Next race starting soon...";
                     setTimeout(lifecycleLoop, 2000);
                     return;
                 }
 
                 const race = await resp.json();
                 currentRaceId = race.race_id;
-                currentRaceHorses = race.horses;
 
-                table.style.display = "table";
-                const headRow = table.querySelector("thead tr");
-                headRow.innerHTML = `<th>Lane</th><th>Horse Spec Sheet</th><th>Current Payout Odds</th>`;
-                
-                tableBody.innerHTML = race.horses.map((horse, idx) => `
-                    <tr>
-                        <td>
-                            <span style="display:inline-block; width:12px; height:12px; background:${HORSE_COLORS[idx % HORSE_COLORS.length]}; border-radius:50%; margin-right:5px; vertical-align:middle;"></span>
-                            Lane ${horse.lane}
-                        </td>
-                        <td><strong>${horse.name}</strong> (Spd: ${horse.base_speed} | Stm: ${horse.stamina})</td>
-                        <td>${horse.odds.toFixed(1)}x</td>
-                    </tr>
-                `).join('');
-
-
-                startCountdown(race.seconds_left);   // hands off; countdown calls back
-
+                buildBettingTable(race.horses);
+                startCountdown(race.seconds_left);
             } catch (err) {
                 console.error("[Lifecycle Error]:", err);
                 statusDiv.textContent = "Arena connection error. Retrying in 3s...";
@@ -354,14 +304,13 @@
         }
 
         function startCountdown(secondsLeft) {
-            const startedAt = performance.now();     // duration-measuring clock
+            const startedAt = performance.now();   // duration clock, immune to wall-clock skew
             function tick() {
                 const elapsed = (performance.now() - startedAt) / 1000;
                 const left = secondsLeft - elapsed;
                 if (left > 0) {
                     statusDiv.textContent = `Betting closes in ${left.toFixed(0)}s`;
-                    setTimeout(tick,250);
-
+                    setTimeout(tick, 250);
                 } else {
                     statusDiv.textContent = "Betting closed";
                     pollForReplay();
@@ -372,24 +321,20 @@
 
         async function pollForReplay() {
             try {
-
                 const resp = await fetch(`/race/${currentRaceId}/replay`);
 
-                if (resp.status === 425) {
-                    setTimeout(pollForReplay,1000);
-                    return 
+                if (resp.status === 425) {          // not revealed yet
+                    setTimeout(pollForReplay, 1000);
+                    return;
                 }
-
-                if (resp.status === 404) {
+                if (resp.status === 404) {          // race vanished — start over
                     lifecycleLoop();
-                    return 
+                    return;
                 }
-
                 if (resp.status === 200) {
                     const data = await resp.json();
-                    startReplay(data.results)
+                    startReplay(data.results);
                 }
-
             } catch (err) {
                 console.error("[Poll for Replay Error]:", err);
                 statusDiv.textContent = "Arena connection error. Retrying in 3s...";
@@ -397,9 +342,9 @@
             }
         }
 
+        // ================= boot =================
         initTrack();
         lifecycleLoop();
-
     </script>
 
 </body>
