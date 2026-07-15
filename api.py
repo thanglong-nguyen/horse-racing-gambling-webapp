@@ -1,29 +1,26 @@
-import random, time, asyncio, json, secrets
+import asyncio
+import json
+import random
+import secrets
+import time
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.staticfiles import StaticFiles 
+from typing import Dict, List, Tuple
+
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.gzip import GZipMiddleware
-from db import get_db, init_db
-from models import (
-    Horse, TrackNode, RaceTrack, Race
-)
-
-# 1. Import RootModel alongside standard Pydantic tools
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, RootModel
-from typing import List, Tuple, Dict
 
-# --- Pydantic Validation Schemas ---
+from db import get_db, init_db
+from models import Horse, Race, RaceTrack, TrackNode
+
+# =====================================================================
+# Response schemas (the API contract — response_model filters output,
+# so anything not listed here never leaves the server)
+# =====================================================================
 
 class TrackResponse(RootModel):
     root: Dict[str, List[Tuple[float, float]]]
-
-class HorseResult(BaseModel):
-    horse: str
-    final_time: float
-    history: List[Tuple[float, float, float]] 
-
-class RaceResponse(BaseModel):
-    results: List[HorseResult]
 
 class RaceHorseInfo(BaseModel):
     lane: int
@@ -39,172 +36,167 @@ class CurrentRaceResponse(BaseModel):
     seconds_left: float
     horses: List[RaceHorseInfo]
 
-# State container for the immutable track
+# =====================================================================
+# Game configuration
+# =====================================================================
+
+BETTING_WINDOW = 30  # seconds
+NUM_LANES = 8
+HORSE_NAMES = ["Thunder", "Blaze", "Storm", "Falcon",
+               "Shadow", "Comet", "Titan", "Vortex"]
+
+# Immutable server-lifetime state (track geometry, outlines)
 assets = {}
 
-def make_track(straight=100, radius=20, lanes=8):
+# =====================================================================
+# Simulation helpers
+# =====================================================================
+
+def make_track(straight=100, radius=20, lanes=NUM_LANES):
     finish = TrackNode(15, 0, -1, "Finish")
     track = RaceTrack(finish_node=finish, straight_length=straight,
                       base_radius=radius, lanes=lanes)
     return track, finish
 
-# Define horse names to pick from
-HORSE_NAMES = ["Thunder", "Blaze", "Storm", "Falcon", "Shadow", "Comet", "Titan", "Vortex"]
-
-def generate_random_horses(rng: random.Random, num_lanes=8):
-    """
-    Generates dynamic horses with stats inside random ranges 
-    and randomly assigns them to available track lanes.
-    """
-    horses = []
-
+def generate_random_horses(rng: random.Random, num_lanes=NUM_LANES):
+    """Roll horse stats from the given (per-race, seeded) RNG and
+    shuffle them into lanes."""
     names_pool = rng.sample(HORSE_NAMES, min(num_lanes, len(HORSE_NAMES)))
-    
+
+    horses = []
     for name in names_pool:
-        speed = round(rng.uniform(20.0, 24.0), 2)          
-        stamina = rng.randint(85, 115)                     
-        loss_rate = round(rng.uniform(0.03, 0.07), 4)      
-        
+        speed = round(rng.uniform(20.0, 24.0), 2)
+        stamina = rng.randint(85, 115)
+        loss_rate = round(rng.uniform(0.03, 0.07), 4)
         horses.append(Horse(name, speed, stamina, loss_rate))
-    
+
     available_lanes = list(range(num_lanes))
     rng.shuffle(available_lanes)
-    
-    horses_with_lanes = []
-    for horse, lane in zip(horses, available_lanes):
-        horses_with_lanes.append((horse, lane))
-        
-    return horses_with_lanes
+
+    return list(zip(horses, available_lanes))
 
 def seeded_run(horses_with_lanes: list, track) -> dict:
+    """Run the full simulation and return the replay payload:
+    decimated position history plus each horse's identity (name + lane)."""
+    race = Race(track=track, horses_with_lanes=horses_with_lanes,
+                tick_dt=1, total_time=1000)
     
-    race = Race(track=track, horses_with_lanes=horses_with_lanes, tick_dt=1, total_time=1000)
+    start_lane = {horse.name: lane for horse, lane in horses_with_lanes}
+
     race.run()
 
     results = []
     for horse_state in race.states:
+        # Keep every 10th sample, but never drop the finish point
         slim = horse_state.history[::10]
-
         if slim[-1] != horse_state.history[-1]:
             slim.append(horse_state.history[-1])
-            
+
         history = [[round(x, 2), round(y, 2), round(t, 3)] for x, y, t in slim]
 
         results.append({
-            "horse": horse_state.horse.name,    
+            "horse": horse_state.horse.name,
+            "lane": start_lane[horse_state.horse.name],   
             "final_time": horse_state.total_time,
-            "history": history
+            "history": history,
         })
 
-    results.sort(key=lambda x: x["final_time"])  
+    results.sort(key=lambda r: r["final_time"])
     return {"results": results}
 
 def settle_race(race_id):
-    pass
+    pass  # Mission 5: pay out winning bets here
 
-
-BETTING_WINDOW = 60  # seconds
+# =====================================================================
+# Race lifecycle: betting -> locked -> revealed -> settled
+# =====================================================================
 
 # TODO startup sweep: void orphaned races, refund their bets.
 async def race_scheduler():
     while True:
         # --- 1. create the next race, status='betting' ---
-        seed = secrets.randbits(32)              # Unpredictable token from OS
-        rng = random.Random(seed)                # Isolated private generator
+        seed = secrets.randbits(32)      # unpredictable token from OS entropy
+        rng = random.Random(seed)        # isolated per-race generator
 
         track = assets["track"]
-        horses = generate_random_horses(rng, num_lanes=8)
-
+        horses = generate_random_horses(rng)
         closes_at = time.time() + BETTING_WINDOW
 
         conn = get_db()
-
         try:
             cursor = conn.cursor()
-            
-            # Insert the race row
             cursor.execute("""
                 INSERT INTO races (status, seed, betting_closes_at)
                 VALUES ('betting', ?, ?)
             """, (seed, closes_at))
-            
             race_id = cursor.lastrowid
 
-            # Insert one race_horses row per horse
             for horse, lane in horses:
                 cursor.execute("""
-                    INSERT INTO race_horses (race_id, lane, name, base_speed, stamina, loss_rate, odds)
+                    INSERT INTO race_horses
+                        (race_id, lane, name, base_speed, stamina, loss_rate, odds)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    race_id, 
-                    lane, 
-                    horse.name, 
-                    horse.base_speed, 
-                    horse.stamina, 
-                    horse.stamina_loss_per_meter, 
-                    5.0
-                ))
-            
+                """, (race_id, lane, horse.name, horse.base_speed,
+                      horse.stamina, horse.stamina_loss_per_meter, 5.0))
             conn.commit()
         finally:
             conn.close()
 
         print(f"[scheduler] race {race_id}: betting open for {BETTING_WINDOW}s")
 
-        # --- 2. wait for the window to close ---
+        # --- 2. wait for the betting window to close ---
         await asyncio.sleep(max(0.0, closes_at - time.time()))
 
-        # --- 3. lock, simulate, reveal ---
+        # --- 3. lock (bets die here), simulate off-thread, reveal ---
         conn = get_db()
         try:
-            # UPDATE status -> 'locked' (bets die HERE)
-            conn.execute("UPDATE races SET status = 'locked' WHERE id = ?", (race_id,))
+            conn.execute("UPDATE races SET status = 'locked' WHERE id = ?",
+                         (race_id,))
             conn.commit()
         finally:
             conn.close()
 
         print(f"[scheduler] race {race_id}: locked, simulating...")
 
-        # Run CPU-bound race simulation inside a thread pool to avoid blocking the main async thread
         result = await asyncio.to_thread(seeded_run, horses, track)
 
         conn = get_db()
         try:
-            # UPDATE the race with the json payload and reveal status
             conn.execute("""
-                UPDATE races 
-                SET result_json = ?, status = 'revealed' 
+                UPDATE races
+                SET result_json = ?, status = 'revealed'
                 WHERE id = ?
             """, (json.dumps(result), race_id))
             conn.commit()
         finally:
             conn.close()
 
-        
         print(f"[scheduler] race {race_id}: revealed")
 
         # --- 4. settle ---
-        settle_race(race_id)     # write it as a stub: def settle_race(rid): pass
+        settle_race(race_id)
 
         conn = get_db()
         try:
-            # Final status update -> 'settled'
-            conn.execute("UPDATE races SET status = 'settled' WHERE id = ?", (race_id,))
+            conn.execute("UPDATE races SET status = 'settled' WHERE id = ?",
+                         (race_id,))
             conn.commit()
         finally:
             conn.close()
 
         print(f"[scheduler] race {race_id}: settled\n")
 
+# =====================================================================
+# App setup
+# =====================================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Built once when the server starts
     print("Initializing Database Schema...")
     init_db()
 
     print("Building RaceTrack...")
-    track, finish = make_track(lanes=8)
+    track, finish = make_track()
 
     outlines = {
         str(lane): [[round(n.x, 1), round(n.y, 1)] for n in nodes[::20]]
@@ -217,25 +209,23 @@ async def lifespan(app: FastAPI):
 
     scheduler_task = asyncio.create_task(race_scheduler())
     scheduler_task.add_done_callback(
-    lambda t: print("[scheduler] DIED:", t.exception()) if not t.cancelled() else None
-)
+        lambda t: print("[scheduler] DIED:", t.exception())
+        if not t.cancelled() else None
+    )
 
     yield
+
     scheduler_task.cancel()
     try:
         await scheduler_task
     except asyncio.CancelledError:
         print("[scheduler] shutdown complete")
-
     assets.clear()
 
 app = FastAPI(lifespan=lifespan)
-
 app.mount("/static", StaticFiles(directory="static", html=True), name="static")
-
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-# Middleware to measure "before and after" automatically
 @app.middleware("http")
 async def add_process_time_header(request: Request, call_next):
     start_time = time.time()
@@ -244,18 +234,79 @@ async def add_process_time_header(request: Request, call_next):
     print(f"Request to {request.url.path} took {process_time:.4f} seconds.")
     return response
 
+# =====================================================================
+# Endpoints
+# =====================================================================
 
 @app.get("/track", response_model=TrackResponse)
 async def get_track_endpoint():
     return assets["outlines"]
 
-@app.post("/race", response_model=RaceResponse)
-def run_race_endpoint():
-    track = assets["track"]
-    
-    # Generate an isolated seed and generator instance here too
-    seed = secrets.randbits(32)
-    rng = random.Random(seed)
-    
-    horses_with_lanes = generate_random_horses(rng, num_lanes=8)
-    return seeded_run(horses_with_lanes, track)
+@app.get("/race/current", response_model=CurrentRaceResponse)
+def get_current_race():
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, betting_closes_at
+            FROM races
+            WHERE status = 'betting'
+            ORDER BY id DESC
+            LIMIT 1
+        """)
+        newest_race = cursor.fetchone()
+
+        if newest_race is None:
+            raise HTTPException(status_code=404, detail="No race open for betting")
+
+        now = time.time()
+        closes_at = newest_race["betting_closes_at"]
+
+        # Belt-and-braces: the scheduler may not have flipped status yet
+        if closes_at <= now:
+            raise HTTPException(status_code=404, detail="No race open for betting")
+
+        race_id = newest_race["id"]
+
+        cursor.execute("""
+            SELECT lane, name, base_speed, stamina, loss_rate, odds
+            FROM race_horses
+            WHERE race_id = ?
+            ORDER BY lane ASC
+        """, (race_id,))
+
+        horses = [dict(row) for row in cursor.fetchall()]
+
+        return {
+            "race_id": race_id,
+            "betting_closes_at": closes_at,
+            "seconds_left": round(max(0.0, closes_at - now), 2),
+            "horses": horses,
+        }
+    finally:
+        conn.close()
+
+@app.get("/race/{race_id}/replay")
+def get_replay(race_id: int):
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT status, result_json FROM races WHERE id = ?", (race_id,))
+        race = cursor.fetchone()
+
+        if race is None:
+            raise HTTPException(status_code=404, detail="Race not found")
+
+        if race["status"] not in ("revealed", "settled"):
+            raise HTTPException(
+                status_code=425,
+                detail="Race results have not been revealed yet")
+
+        if not race["result_json"]:
+            raise HTTPException(
+                status_code=500, detail="Race data is missing result JSON")
+
+        return json.loads(race["result_json"])
+    finally:
+        conn.close()
