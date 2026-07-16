@@ -68,6 +68,18 @@
         <canvas id="race-canvas" width="1200" height="800"></canvas>
     </div>
 
+    <div id="player-panel">
+        <!-- shown when no token in localStorage -->
+        <div id="join-box">
+            <input id="name-input" placeholder="Your name">
+            <button id="join-btn">Join</button>
+        </div>
+        <!-- shown when we have a token -->
+        <div id="wallet" style="display:none;">
+            <strong id="player-name"></strong> — balance: $<span id="balance"></span>
+        </div>
+    </div>
+
     <div class="controls-panel">
         <div id="status">Loading track layout...</div>
 
@@ -178,6 +190,110 @@
             });
         }
 
+        // ================= player =================
+        let playerToken = localStorage.getItem('token');
+        let playerName  = localStorage.getItem('name');
+
+        async function joinGame() {
+            const name = document.getElementById('name-input').value.trim();
+            if (!name) return;
+            const resp = await fetch('/player', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name })
+            });
+            
+            if (resp.status === 409) {
+                alert("Name taken");
+                return;
+            }
+            
+            const player = await resp.json();
+            
+            // 1. save token + name to localStorage
+
+            localStorage.setItem('token', player.token);
+            localStorage.setItem('name', player.name);
+
+            // 2. set playerToken/playerName
+
+            playerToken = player.token;
+            playerName  = player.name;
+
+            // 3. call showWallet(player.balance)
+
+            showWallet(player.balance);
+        }
+
+        function showWallet(balance) {
+            document.getElementById('join-box').style.display = 'none';
+
+            const wallet = document.getElementById('wallet');
+            wallet.style.display = 'block';
+
+            document.getElementById('player-name').textContent = playerName;
+            document.getElementById('balance').textContent = balance.toFixed(2);
+        }
+
+        async function refreshBalance() {
+            if (!playerToken) return;
+            const resp = await fetch('/player/balance', {
+                headers: { 'Authorization': `Bearer ${playerToken}` }
+            });
+            if (resp.status === 401) {
+                // token is dead (e.g. you deleted race.db) 
+                localStorage.removeItem('token');
+                localStorage.removeItem('name');
+                return;
+            }
+
+            if (!resp.ok) {                 // anything else unexpected
+                console.error("[Balance] unexpected status:", resp.status);
+                return;
+            }
+            
+            const wallet = await resp.json();
+
+            showWallet(wallet.balance);
+        }
+
+        async function placeBet(lane) {
+            const amount = 100;   // fixed stake for now — input field later
+            const resp = await fetch('/bet', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    token: playerToken,
+                    race_id: currentRaceId,
+                    lane: lane,
+                    amount: amount
+                })
+            });
+            // status branches, same pattern as pollForReplay:
+            // 402 -> "not enough funds", 409 -> "betting closed",
+            // 200 -> update the balance display from new_balance
+
+            if (resp.status === 402) {
+                alert("Not enough funds");
+                return;
+            }
+
+            if (resp.status === 409) {
+                alert("Betting closed");
+                return;
+            }
+
+            if (!resp.ok) {
+                alert("Bet failed");
+                return;
+            }
+
+            const data = await resp.json();
+
+            // Update wallet balance
+            showWallet(data.new_balance);
+        }
+
         // ================= replay =================
         let raceResults = null;    // results array from /race/{id}/replay
         let raceStart = null;      // ms timestamp of the first replay frame
@@ -241,6 +357,7 @@
                 requestAnimationFrame(frame);
             } else {
                 buildResultsTable(raceResults);
+                refreshBalance();
                 statusDiv.textContent = "Race completed! The results are shown below.";
                 setTimeout(lifecycleLoop, 5000);
             }
@@ -267,14 +384,20 @@
         }
 
         function buildBettingTable(horses) {
-            tableHeadRow.innerHTML = `<th>Lane</th><th>Horse Spec Sheet</th><th>Current Payout Odds</th>`;
+            tableHeadRow.innerHTML = `<th>Lane</th><th>Horse Spec Sheet</th><th>Current Payout Odds</th><th>Bet</th>`;
             tableBody.innerHTML = horses.map(horse => `
                 <tr>
                     <td>${colorDot(horse.lane)}Lane ${horse.lane}</td>
                     <td><strong>${horse.name}</strong> (Spd: ${horse.base_speed} | Stm: ${horse.stamina})</td>
                     <td>${horse.odds.toFixed(1)}x</td>
+                    <td><button class="bet-btn" data-lane="${horse.lane}">Bet $100</button></td>
                 </tr>
             `).join('');
+
+            tableBody.querySelectorAll('.bet-btn').forEach(btn => {
+                btn.addEventListener('click', () => placeBet(Number(btn.dataset.lane)));
+            });
+
             table.style.display = "table";
         }
 
@@ -343,6 +466,8 @@
         }
 
         // ================= boot =================
+        document.getElementById('join-btn').addEventListener('click', joinGame);
+        refreshBalance()
         initTrack();
         lifecycleLoop();
     </script>
