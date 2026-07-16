@@ -7,7 +7,7 @@ import sqlite3
 from contextlib import asynccontextmanager
 from typing import Dict, List, Tuple
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, RootModel
@@ -36,6 +36,11 @@ class CurrentRaceResponse(BaseModel):
     betting_closes_at: float
     seconds_left: float
     horses: List[RaceHorseInfo]
+
+
+class PlayerBalanceResponse(BaseModel):
+    name: str
+    balance: float
 
 # =====================================================================
 # Game configuration
@@ -105,9 +110,6 @@ def seeded_run(horses_with_lanes: list, track) -> dict:
     results.sort(key=lambda r: r["final_time"])
     return {"results": results}
 
-def settle_race(race_id):
-    pass  # Mission 5: pay out winning bets here
-
 # =====================================================================
 # Race lifecycle: betting -> locked -> revealed -> settled
 # =====================================================================
@@ -175,7 +177,7 @@ async def race_scheduler():
         print(f"[scheduler] race {race_id}: revealed")
 
         # --- 4. settle ---
-        settle_race(race_id)
+        await asyncio.to_thread(settle_race, race_id, result["results"][0]["lane"])
 
         conn = get_db()
         try:
@@ -457,6 +459,79 @@ def place_bet(body: BetRequest):
             "new_balance": new_balance
         }
 
+    finally:
+        conn.close()
+
+@app.get("/player/balance", response_model=PlayerBalanceResponse)
+def get_me(authorization: str = Header(None)):
+    # --- check 1: header exists and uses the Bearer scheme ---
+    if authorization is None or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or malformed token")
+
+    token = authorization.removeprefix("Bearer ")
+
+    # --- check 2: token maps to a real player ---
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT name, balance FROM players WHERE token = ?",
+            (token,)
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise HTTPException(status_code=401, detail="Unknown token")
+
+        return {"name": row["name"], "balance": row["balance"]}
+    finally:
+        conn.close()
+
+
+def settle_race(race_id, winning_lane):
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+
+        # 1. Fetch all unsettled bets for this race:
+        #    SELECT id, player_id, lane, amount, odds FROM bets
+        #    WHERE race_id = ? AND settled = 0
+        cursor.execute(
+            """
+            SELECT id, player_id, lane, amount, odds
+            FROM bets
+            WHERE race_id = ? AND settled = 0
+            """,
+            (race_id,)
+        )
+        bets = cursor.fetchall()
+        # 2. For each bet: if bet lane == winning_lane,
+        #    UPDATE players SET balance = balance + ? ...
+        #    (payout = amount * odds)
+        for _, player_id, lane, amount, odds in bets:
+            if lane == winning_lane:
+                payout = amount * odds
+                cursor.execute(
+                    """
+                    UPDATE players
+                    SET balance = balance + ?
+                    WHERE id = ?
+                    """,
+                    (payout, player_id)
+                )
+
+        # 3. Mark ALL of this race's unsettled bets settled = 1
+        #    (one UPDATE can do the whole race — no loop needed)
+        cursor.execute(
+            """
+            UPDATE bets
+            SET settled = 1
+            WHERE race_id = ? AND settled = 0
+            """,
+            (race_id,)
+        )
+
+        conn.commit()      # ONE commit for the entire settlement
+        print(f"[settle] race {race_id}: paid lane {winning_lane}")
     finally:
         conn.close()
 
