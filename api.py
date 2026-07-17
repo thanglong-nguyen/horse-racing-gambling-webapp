@@ -37,7 +37,6 @@ class CurrentRaceResponse(BaseModel):
     seconds_left: float
     horses: List[RaceHorseInfo]
 
-
 class PlayerBalanceResponse(BaseModel):
     name: str
     balance: float
@@ -50,6 +49,18 @@ BETTING_WINDOW = 30  # seconds
 NUM_LANES = 8
 HORSE_NAMES = ["Thunder", "Blaze", "Storm", "Falcon",
                "Shadow", "Comet", "Titan", "Vortex"]
+
+STARTING_BALANCE = 1000.0
+
+# --- odds / pool configuration ---
+HOUSE_EDGE = 0.15        # the house's cut of the pool
+TOTAL_SEED = 400.0       # phantom house money, spread across the field
+                         # by estimated strength — PRICING ONLY, never paid out
+MIN_ODDS = 1.01
+MIN_BET = 1.0
+LANE_WEIGHT = 0.1        # score penalty per lane out from the rail.
+                         # PROVISIONAL — calibrate with quant.py (measure
+                         # real win rates per lane over N simulated races)
 
 # Immutable server-lifetime state (track geometry, outlines)
 assets = {}
@@ -86,7 +97,7 @@ def seeded_run(horses_with_lanes: list, track) -> dict:
     decimated position history plus each horse's identity (name + lane)."""
     race = Race(track=track, horses_with_lanes=horses_with_lanes,
                 tick_dt=1, total_time=1000)
-    
+
     start_lane = {horse.name: lane for horse, lane in horses_with_lanes}
 
     race.run()
@@ -102,7 +113,7 @@ def seeded_run(horses_with_lanes: list, track) -> dict:
 
         results.append({
             "horse": horse_state.horse.name,
-            "lane": start_lane[horse_state.horse.name],   
+            "lane": start_lane[horse_state.horse.name],
             "final_time": horse_state.total_time,
             "history": history,
         })
@@ -111,10 +122,93 @@ def seeded_run(horses_with_lanes: list, track) -> dict:
     return {"results": results}
 
 # =====================================================================
+# Odds: pari-mutuel pricing
+#
+# Displayed odds are APPROXIMATE — a live projection of what the pool
+# would pay right now. Actual payouts are computed at settlement from
+# the final pool (true pari-mutuel), which makes pool-manipulation
+# attacks unprofitable by construction: inflating the pool to juice a
+# lane's odds just dilutes your own share of it.
+# =====================================================================
+
+def estimate_strengths(horses):
+    """horses: rows with lane, base_speed, stamina, loss_rate.
+    Returns {lane: probability}, summing to 1.0. The house's opening
+    handicap — used only to spread the phantom seed liquidity."""
+    scores = {}
+    for row in horses:
+        lane = row["lane"]
+        score = (
+            row["base_speed"]
+            + 0.05 * row["stamina"]
+            - 100 * row["loss_rate"]
+            - LANE_WEIGHT * lane      # inner lanes run a shorter loop
+        )
+        scores[lane] = score
+
+    # Raw scores sit in a narrow band; raising to a power stretches
+    # the gaps so favorites/longshots separate.
+    k = 8
+    powered = {lane: (score ** k) for lane, score in scores.items()}
+    total = sum(powered.values())
+
+    return {lane: powered[lane] / total for lane in powered}
+
+def recompute_odds(cursor, race_id):
+    """Reprice all lanes from stats + betting pool.
+    Runs inside the caller's transaction — NO commit in here."""
+    # 1. Load stats -> house handicap
+    cursor.execute(
+        """
+        SELECT lane, base_speed, stamina, loss_rate
+        FROM race_horses
+        WHERE race_id = ?
+        """,
+        (race_id,)
+    )
+    horses = cursor.fetchall()
+    strengths = estimate_strengths(horses)
+
+    # 2. Real money per lane
+    cursor.execute(
+        """
+        SELECT lane, SUM(amount)
+        FROM bets
+        WHERE race_id = ?
+        GROUP BY lane
+        """,
+        (race_id,)
+    )
+    real_money = {row[0]: row[1] for row in cursor.fetchall()}
+    for row in horses:
+        real_money.setdefault(row["lane"], 0.0)
+
+    # 3. Totals (real + phantom seed)
+    real_total = sum(real_money.values())
+    grand_total = real_total + TOTAL_SEED
+
+    # 4. Reprice every lane
+    for row in horses:
+        lane = row["lane"]
+        seed_lane = TOTAL_SEED * strengths[lane]
+        lane_money = real_money[lane] + seed_lane
+
+        odds = grand_total * (1 - HOUSE_EDGE) / lane_money
+        odds = max(MIN_ODDS, round(odds, 2))
+
+        cursor.execute(
+            """
+            UPDATE race_horses
+            SET odds = ?
+            WHERE race_id = ? AND lane = ?
+            """,
+            (odds, race_id, lane)
+        )
+
+# =====================================================================
 # Race lifecycle: betting -> locked -> revealed -> settled
 # =====================================================================
 
-# TODO startup sweep: void orphaned races, refund their bets.
 async def race_scheduler():
     while True:
         # --- 1. create the next race, status='betting' ---
@@ -141,6 +235,9 @@ async def race_scheduler():
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, (race_id, lane, horse.name, horse.base_speed,
                       horse.stamina, horse.stamina_loss_per_meter, 5.0))
+
+            recompute_odds(cursor, race_id)   # opening line overwrites the 5.0
+
             conn.commit()
         finally:
             conn.close()
@@ -189,6 +286,158 @@ async def race_scheduler():
 
         print(f"[scheduler] race {race_id}: settled\n")
 
+def settle_race(race_id, winning_lane):
+    """Pari-mutuel settlement with the house in the pool.
+
+    The house's phantom seed bets are treated as REAL at settlement:
+    the payout pool is (real bets + TOTAL_SEED) minus the edge, and the
+    winning side includes the house's seed share on that lane. This
+    makes the board formula and the settlement formula identical, so
+    the displayed odds ARE the current projected payout — honest by
+    construction.
+
+    Per-bet frozen odds are still ignored at payout (receipt only), so
+    pool manipulation stays unprofitable: pumping money into losing
+    lanes grows a pool your own late bet must win back from its own
+    diluted share. The house pays winners from its pocket when real
+    money is thin (bounded by ~TOTAL_SEED per race); the 15% edge
+    covers that long-run, provided estimate_strengths stays calibrated."""
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+
+        # House handicap — the same strengths used for pricing
+        cursor.execute(
+            """
+            SELECT lane, base_speed, stamina, loss_rate
+            FROM race_horses
+            WHERE race_id = ?
+            """,
+            (race_id,)
+        )
+        strengths = estimate_strengths(cursor.fetchall())
+
+        cursor.execute(
+            """
+            SELECT id, player_id, lane, amount
+            FROM bets
+            WHERE race_id = ? AND settled = 0
+            """,
+            (race_id,)
+        )
+        bets = cursor.fetchall()
+
+        real_total = sum(bet["amount"] for bet in bets)
+        real_winner_pool = sum(bet["amount"] for bet in bets
+                               if bet["lane"] == winning_lane)
+
+        grand_pool = real_total + TOTAL_SEED
+        payout_pool = grand_pool * (1 - HOUSE_EDGE)
+        # Winning side = real money on the lane + the house's seed bet
+        # on it. The house's own share of the winnings simply stays with
+        # the house — no row to update.
+        winner_money = real_winner_pool + TOTAL_SEED * strengths[winning_lane]
+
+        for bet in bets:
+            if bet["lane"] != winning_lane:
+                continue
+            share = bet["amount"] / winner_money * payout_pool
+            # Minimum-payoff rule (real tracks have one too): a winning
+            # bet never pays less than the stake back. Kicks in only if
+            # >85% of the grand pool sits on the winner.
+            payout = round(max(bet["amount"], share), 2)
+            cursor.execute(
+                """
+                UPDATE players
+                SET balance = balance + ?
+                WHERE id = ?
+                """,
+                (payout, bet["player_id"])
+            )
+
+        cursor.execute(
+            """
+            UPDATE bets
+            SET settled = 1
+            WHERE race_id = ? AND settled = 0
+            """,
+            (race_id,)
+        )
+
+        conn.commit()      # ONE commit for the entire settlement
+        print(f"[settle] race {race_id}: lane {winning_lane} won, "
+              f"real pool {real_total:.2f}, "
+              f"winner side {winner_money:.2f} "
+              f"(real {real_winner_pool:.2f})")
+    finally:
+        conn.close()
+
+def sweep_orphan_races():
+    """Refund unsettled bets on races that never reached 'settled'.
+    Runs once at startup, before the scheduler creates new races."""
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+
+        # 1. Find orphaned races (not settled, not voided)
+        cursor.execute(
+            """
+            SELECT id
+            FROM races
+            WHERE status NOT IN ('settled', 'void')
+            """
+        )
+        orphans = [row[0] for row in cursor.fetchall()]
+
+        for race_id in orphans:
+            # 2. Fetch all unsettled bets for this race
+            cursor.execute(
+                """
+                SELECT id, player_id, amount
+                FROM bets
+                WHERE race_id = ? AND settled = 0
+                """,
+                (race_id,)
+            )
+            bets = cursor.fetchall()
+
+            # 3. Refund each bet (stake returned, no winnings — the race
+            #    never happened)
+            for bet_id, player_id, amount in bets:
+                cursor.execute(
+                    """
+                    UPDATE players
+                    SET balance = balance + ?
+                    WHERE id = ?
+                    """,
+                    (amount, player_id)
+                )
+
+            # 4. Mark all bets as settled
+            cursor.execute(
+                """
+                UPDATE bets
+                SET settled = 1
+                WHERE race_id = ? AND settled = 0
+                """,
+                (race_id,)
+            )
+
+            # 5. Mark race as void
+            cursor.execute(
+                """
+                UPDATE races
+                SET status = 'void'
+                WHERE id = ?
+                """,
+                (race_id,)
+            )
+
+        conn.commit()   # one transaction: a crash mid-sweep rolls back clean
+        print(f"[sweep] voided {len(orphans)} orphan race(s)")
+    finally:
+        conn.close()
+
 # =====================================================================
 # App setup
 # =====================================================================
@@ -197,6 +446,7 @@ async def race_scheduler():
 async def lifespan(app: FastAPI):
     print("Initializing Database Schema...")
     init_db()
+    sweep_orphan_races()
 
     print("Building RaceTrack...")
     track, finish = make_track()
@@ -314,9 +564,6 @@ def get_replay(race_id: int):
     finally:
         conn.close()
 
-
-STARTING_BALANCE = 1000.0
-
 class PlayerCreate(BaseModel):
     name: str
 
@@ -328,41 +575,34 @@ class PlayerResponse(BaseModel):
 
 @app.post("/player", response_model=PlayerResponse)
 def create_player(body: PlayerCreate):
-    token = secrets.token_hex(16)     # same module as race seeds — why not random?
+    token = secrets.token_hex(16)
     conn = get_db()
     try:
-        # INSERT the player. Two things to handle:
-        # 1. name is UNIQUE — a duplicate raises sqlite3.IntegrityError.
-        #    Catch it and raise HTTPException(409, "Name taken").
-        # 2. use cursor.lastrowid for player_id, like in the scheduler.
-        
-        # 1. Attempt to insert the new player using parameterized queries
-
         cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO players (name, token, balance) VALUES (?, ?, ?)",
             (body.name, token, STARTING_BALANCE)
         )
         conn.commit()
-        
+
         player_id = cursor.lastrowid
-        
+
         return {
             "player_id": player_id,
             "name": body.name,
             "token": token,
-            "balance" : STARTING_BALANCE
+            "balance": STARTING_BALANCE,
         }
-        
+
     except sqlite3.IntegrityError:
         conn.rollback()
         raise HTTPException(status_code=409, detail="Name taken")
-        
+
     finally:
         conn.close()
 
 class BetRequest(BaseModel):
-    token: str       
+    token: str
     race_id: int
     lane: int
     amount: float
@@ -373,9 +613,9 @@ def place_bet(body: BetRequest):
     try:
         cursor = conn.cursor()
 
-        # 1. amount > 0
-        if body.amount <= 0:
-            raise HTTPException(status_code=400, detail="Bet amount must be positive")
+        # 1. amount sane (the minimum itself must pass)
+        if body.amount < MIN_BET:
+            raise HTTPException(status_code=400, detail="Minimum bet is $1")
 
         # 2. token -> player row
         cursor.execute(
@@ -416,6 +656,8 @@ def place_bet(body: BetRequest):
         if horse_row is None:
             raise HTTPException(status_code=404, detail="Lane not found")
 
+        # Recorded for the player's receipt only — the board price at
+        # bet time. Settlement is pari-mutuel and ignores this.
         odds = horse_row[0]
 
         # 5+6. Atomic balance check + subtraction
@@ -433,7 +675,6 @@ def place_bet(body: BetRequest):
                 conn.rollback()
                 raise HTTPException(status_code=402, detail="Insufficient funds")
 
-            # Insert bet
             cursor.execute(
                 """
                 INSERT INTO bets (race_id, player_id, lane, amount, odds, settled)
@@ -443,6 +684,8 @@ def place_bet(body: BetRequest):
             )
 
             bet_id = cursor.lastrowid
+
+            recompute_odds(cursor, body.race_id)   # reprice the board
 
             conn.commit()
 
@@ -485,54 +728,3 @@ def get_me(authorization: str = Header(None)):
         return {"name": row["name"], "balance": row["balance"]}
     finally:
         conn.close()
-
-
-def settle_race(race_id, winning_lane):
-    conn = get_db()
-    try:
-        cursor = conn.cursor()
-
-        # 1. Fetch all unsettled bets for this race:
-        #    SELECT id, player_id, lane, amount, odds FROM bets
-        #    WHERE race_id = ? AND settled = 0
-        cursor.execute(
-            """
-            SELECT id, player_id, lane, amount, odds
-            FROM bets
-            WHERE race_id = ? AND settled = 0
-            """,
-            (race_id,)
-        )
-        bets = cursor.fetchall()
-        # 2. For each bet: if bet lane == winning_lane,
-        #    UPDATE players SET balance = balance + ? ...
-        #    (payout = amount * odds)
-        for _, player_id, lane, amount, odds in bets:
-            if lane == winning_lane:
-                payout = amount * odds
-                cursor.execute(
-                    """
-                    UPDATE players
-                    SET balance = balance + ?
-                    WHERE id = ?
-                    """,
-                    (payout, player_id)
-                )
-
-        # 3. Mark ALL of this race's unsettled bets settled = 1
-        #    (one UPDATE can do the whole race — no loop needed)
-        cursor.execute(
-            """
-            UPDATE bets
-            SET settled = 1
-            WHERE race_id = ? AND settled = 0
-            """,
-            (race_id,)
-        )
-
-        conn.commit()      # ONE commit for the entire settlement
-        print(f"[settle] race {race_id}: paid lane {winning_lane}")
-    finally:
-        conn.close()
-
-
