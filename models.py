@@ -329,15 +329,15 @@ class Race:
             )
 
 
-            print(
-                f"[DEBUG] {horse.name}: "
-                f"path_len={len(path) if path else 0}, "
-                f"tick_time={tick_time:.3f}, "
-                f"total_time={new_total_time:.3f}, "
-                f"final_node={final_node}, "
-                f"final_speed={final_speed:.2f}, "
-                f"final_stamina={final_stamina:.2f}"
-            )
+            # print(
+            #     f"[DEBUG] {horse.name}: "
+            #     f"path_len={len(path) if path else 0}, "
+            #     f"tick_time={tick_time:.3f}, "
+            #     f"total_time={new_total_time:.3f}, "
+            #     f"final_node={final_node}, "
+            #     f"final_speed={final_speed:.2f}, "
+            #     f"final_stamina={final_stamina:.2f}"
+            # )
 
             # Nothing useful planned this tick: the horse stays where it
             # is, so its synthetic reservation stays in place for later
