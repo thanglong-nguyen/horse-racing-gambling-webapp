@@ -58,7 +58,7 @@ TOTAL_SEED = 400.0       # phantom house money, spread across the field
                          # by estimated strength — PRICING ONLY, never paid out
 MIN_ODDS = 1.01
 MIN_BET = 1.0
-LANE_WEIGHT = 0.1        # score penalty per lane out from the rail.
+LANE_WEIGHT = 0.7        # score penalty per lane out from the rail.
                          # PROVISIONAL — calibrate with quant.py (measure
                          # real win rates per lane over N simulated races)
 
@@ -148,7 +148,7 @@ def estimate_strengths(horses):
 
     # Raw scores sit in a narrow band; raising to a power stretches
     # the gaps so favorites/longshots separate.
-    k = 8
+    k = 12
     powered = {lane: (score ** k) for lane, score in scores.items()}
     total = sum(powered.values())
 
