@@ -4,7 +4,8 @@ DB_PATH = "race.db"
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row      # rows behave like dicts: row["status"]
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON;")
     return conn
     
 
@@ -55,7 +56,6 @@ CREATE TABLE IF NOT EXISTS bets (
 
 def init_db():
     conn = get_db()
-    conn.execute("PRAGMA foreign_keys = ON;")
     conn.executescript(SCHEMA)
     conn.commit()
     conn.close()
