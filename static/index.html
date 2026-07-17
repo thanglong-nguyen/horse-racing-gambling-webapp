@@ -58,6 +58,7 @@
         }
         th { background-color: #4a5568; color: white; }
         tr:nth-child(even) { background-color: #f7fafc; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
     </style>
 </head>
 <body>
@@ -202,25 +203,19 @@
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ name })
             });
-            
+
             if (resp.status === 409) {
                 alert("Name taken");
                 return;
             }
-            
+
             const player = await resp.json();
-            
-            // 1. save token + name to localStorage
 
             localStorage.setItem('token', player.token);
             localStorage.setItem('name', player.name);
 
-            // 2. set playerToken/playerName
-
             playerToken = player.token;
             playerName  = player.name;
-
-            // 3. call showWallet(player.balance)
 
             showWallet(player.balance);
         }
@@ -241,20 +236,17 @@
                 headers: { 'Authorization': `Bearer ${playerToken}` }
             });
             if (resp.status === 401) {
-                // token is dead (e.g. you deleted race.db) 
+                // token is dead (e.g. the DB was reset) — forget it
                 localStorage.removeItem('token');
                 localStorage.removeItem('name');
                 return;
             }
-
-            if (!resp.ok) {                 // anything else unexpected
+            if (!resp.ok) {
                 console.error("[Balance] unexpected status:", resp.status);
                 return;
             }
-            
-            const wallet = await resp.json();
-
-            showWallet(wallet.balance);
+            const me = await resp.json();
+            showWallet(me.balance);
         }
 
         async function placeBet(lane) {
@@ -269,28 +261,21 @@
                     amount: amount
                 })
             });
-            // status branches, same pattern as pollForReplay:
-            // 402 -> "not enough funds", 409 -> "betting closed",
-            // 200 -> update the balance display from new_balance
 
             if (resp.status === 402) {
                 alert("Not enough funds");
                 return;
             }
-
             if (resp.status === 409) {
                 alert("Betting closed");
                 return;
             }
-
             if (!resp.ok) {
                 alert("Bet failed");
                 return;
             }
 
             const data = await resp.json();
-
-            // Update wallet balance
             showWallet(data.new_balance);
         }
 
@@ -357,7 +342,7 @@
                 requestAnimationFrame(frame);
             } else {
                 buildResultsTable(raceResults);
-                refreshBalance();
+                refreshBalance();   // settlement has run — learn your fate
                 statusDiv.textContent = "Race completed! The results are shown below.";
                 setTimeout(lifecycleLoop, 5000);
             }
@@ -384,12 +369,13 @@
         }
 
         function buildBettingTable(horses) {
-            tableHeadRow.innerHTML = `<th>Lane</th><th>Horse Spec Sheet</th><th>Current Payout Odds</th><th>Bet</th>`;
+            tableHeadRow.innerHTML = `<th>Lane</th><th>Horse Spec Sheet</th>
+                <th>Approx. Odds</th><th>Bet</th>`;
             tableBody.innerHTML = horses.map(horse => `
                 <tr>
                     <td>${colorDot(horse.lane)}Lane ${horse.lane}</td>
                     <td><strong>${horse.name}</strong> (Spd: ${horse.base_speed} | Stm: ${horse.stamina})</td>
-                    <td>${horse.odds.toFixed(1)}x</td>
+                    <td>${horse.odds.toFixed(2)}x</td>
                     <td><button class="bet-btn" data-lane="${horse.lane}">Bet $100</button></td>
                 </tr>
             `).join('');
@@ -399,6 +385,12 @@
             });
 
             table.style.display = "table";
+        }
+
+        function disableBetButtons() {
+            tableBody.querySelectorAll('.bet-btn').forEach(btn => {
+                btn.disabled = true;
+            });
         }
 
         // ================= lifecycle =================
@@ -426,16 +418,39 @@
             }
         }
 
+        // Re-fetch the board every few seconds while betting is open, so
+        // the (pari-mutuel, approximate) odds visibly move with the pool.
+        const ODDS_REFRESH_SECONDS = 3;
+
         function startCountdown(secondsLeft) {
             const startedAt = performance.now();   // duration clock, immune to wall-clock skew
+            let lastOddsRefresh = 0;
+
             function tick() {
                 const elapsed = (performance.now() - startedAt) / 1000;
                 const left = secondsLeft - elapsed;
+
                 if (left > 0) {
                     statusDiv.textContent = `Betting closes in ${left.toFixed(0)}s`;
+
+                    if (elapsed - lastOddsRefresh > ODDS_REFRESH_SECONDS) {
+                        lastOddsRefresh = elapsed;
+                        fetch('/race/current')
+                            .then(r => r.ok ? r.json() : null)
+                            .then(race => {
+                                // Only rebuild if it's still the same race —
+                                // a 404/new race is the lifecycle loop's job.
+                                if (race && race.race_id === currentRaceId) {
+                                    buildBettingTable(race.horses);
+                                }
+                            })
+                            .catch(() => {});   // countdown must not die on a blip
+                    }
+
                     setTimeout(tick, 250);
                 } else {
                     statusDiv.textContent = "Betting closed";
+                    disableBetButtons();   // board frozen — server enforces it anyway
                     pollForReplay();
                 }
             }
@@ -467,7 +482,7 @@
 
         // ================= boot =================
         document.getElementById('join-btn').addEventListener('click', joinGame);
-        refreshBalance()
+        refreshBalance();
         initTrack();
         lifecycleLoop();
     </script>
