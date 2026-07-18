@@ -1,4 +1,4 @@
-# 🏇 Horse Race Arena
+# 🏇 Triomphe - Horse Racing Betting Arena
 
 This is my magnum opus, my Mona Lisa and Starry Night, and I'm still painting it.
 
@@ -16,9 +16,8 @@ having a lot of fun doing so.
 https://github.com/user-attachments/assets/2e132759-53a6-4987-8e66-831a19215e02
 
 
-A full-stack horse-race betting game. Races run on **Triomphe**, a custom
-multi-agent A\* pathfinding engine I built first as a standalone simulation
-project; players bet into a shared pool with live-moving odds, watch the race
+A full-stack horse-race betting game. named after its heart: a custom A* pathfinding engine I built first as a standalone project;
+players bet into a shared pool with live-moving odds, watch the race
 replay on canvas, and get paid out pari-mutuel style, same as a real track.
 
 **Play it live:** *(link coming, deploying to Render)*
