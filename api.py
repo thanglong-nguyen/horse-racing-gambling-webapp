@@ -10,10 +10,12 @@ from typing import Dict, List, Tuple
 from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, RootModel
 
 from db import get_db, init_db
 from models import Horse, Race, RaceTrack, TrackNode
+
 
 # =====================================================================
 # Response schemas (the API contract — response_model filters output,
@@ -746,3 +748,8 @@ def get_me(authorization: str = Header(None)):
         return {"name": row["name"], "balance": row["balance"]}
     finally:
         conn.close()
+
+
+@app.get("/")
+def root():
+    return RedirectResponse(url="/static/")
