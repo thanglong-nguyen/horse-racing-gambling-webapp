@@ -16,7 +16,7 @@ having a lot of fun doing so.
 https://github.com/user-attachments/assets/2e132759-53a6-4987-8e66-831a19215e02
 
 
-A full-stack horse-race betting game. named after its heart: a custom A* pathfinding engine I built first as a standalone project;
+A full-stack horse-race betting game. Named after its heart: a custom A* pathfinding engine I built first as a standalone project;
 players bet into a shared pool with live-moving odds, watch the race
 replay on canvas, and get paid out pari-mutuel style, same as a real track.
 
