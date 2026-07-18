@@ -12,8 +12,9 @@ having a lot of fun doing so.
 
 > **Status: WIP 🚧** — v1 is fully playable end-to-end. Roadmap at the bottom.
 
-<!-- GIF: betting board with moving odds → countdown → race replay → results. ~20s -->
-![demo](docs/demo.gif)
+
+https://github.com/user-attachments/assets/2e132759-53a6-4987-8e66-831a19215e02
+
 
 A full-stack horse-race betting game. Races run on **Triomphe**, a custom
 multi-agent A\* pathfinding engine I built first as a standalone simulation
