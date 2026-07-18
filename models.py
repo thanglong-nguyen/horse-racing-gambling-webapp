@@ -234,11 +234,6 @@ class RaceTrack:
     def get_lane_coordinates(self, lane_index):
         return list(self.nodes[lane_index].keys())
 
-
-
-from matplotlib.animation import FuncAnimation
-import matplotlib.pyplot as plt
-
 class Race:
     def __init__(self, horses_with_lanes, track, tick_dt=0.2, total_time=6.0):
         """

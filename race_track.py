@@ -1,4 +1,3 @@
-import matplotlib.pyplot as plt
 from Stamina import *
 import math
 import heapq
