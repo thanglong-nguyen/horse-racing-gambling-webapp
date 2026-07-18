@@ -20,7 +20,7 @@ A full-stack horse-race betting game. Named after its heart: a custom A* pathfin
 players bet into a shared pool with live-moving odds, watch the race
 replay on canvas, and get paid out pari-mutuel style, same as a real track.
 
-**Play it live:** *(link coming, deploying to Render)*
+**Play it live:** https://triomphe.onrender.com
 
 ---
 
