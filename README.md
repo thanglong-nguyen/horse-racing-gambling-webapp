@@ -103,9 +103,15 @@ doomed horse in lane 7. And no, the house can't go broke, because your own
 stake dilutes the payout the moment you bet.
 
 ### Tuning the odds (quant.py)
-The handicapper's weights aren't guesses. `quant.py` runs the real engine a
-thousand times and compares the handicapper's predicted win rates against
-what actually happens, so the weights can be tuned until they agree.
+The handicapper's weights started as guesses, and a bookmaker that guesses
+is a bookmaker that loses: any horse it misprices is free money for whoever
+spots it. But unlike a real bookmaker, I own the race engine, so I can just
+ask it. `quant.py` simulates a thousand races and compares the handicapper's
+predictions against what actually happens, and the weights get tuned until
+they agree. It's already paid for itself: it revealed that the starting lane
+matters more than any horse stat (the rail wins ~28% of races, the outside
+lane ~4%), which the odds now price in. Whenever the engine or track
+changes, it runs again.
 
 ```bash
 python quant.py 1000
