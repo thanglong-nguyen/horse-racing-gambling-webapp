@@ -276,11 +276,19 @@ async def race_scheduler():
         # --- 4. settle ---
         await asyncio.to_thread(settle_race, race_id, result["results"][0]["lane"])
 
+        REPLAY_BUFFER = 8.0   # results-viewing pause, a touch more than the client's 5s
+
+        replay_duration = result["results"][-1]["final_time"]
+        print(f"[scheduler] race {race_id}: replay window {replay_duration:.0f}s")
+        await asyncio.sleep(replay_duration + REPLAY_BUFFER)
+
         conn = get_db()
         try:
-            conn.execute("UPDATE races SET status = 'settled' WHERE id = ?",
-                         (race_id,))
-            conn.commit()
+            cursor = conn.cursor()
+            prune_old_races(cursor, race_id)
+            cursor.execute("UPDATE races SET status = 'settled' WHERE id = ?",
+                           (race_id,))
+            conn.commit()   # prune + status flip land together
         finally:
             conn.close()
 
@@ -437,6 +445,16 @@ def sweep_orphan_races():
         print(f"[sweep] voided {len(orphans)} orphan race(s)")
     finally:
         conn.close()
+
+KEEP_RACES = 50
+
+def prune_old_races(cursor, current_race_id):
+    """Drop ancient races and their child rows. Settled bets have already
+    paid out — player balances are the surviving record."""
+    cutoff = current_race_id - KEEP_RACES
+    cursor.execute("DELETE FROM bets        WHERE race_id < ?", (cutoff,))
+    cursor.execute("DELETE FROM race_horses WHERE race_id < ?", (cutoff,))
+    cursor.execute("DELETE FROM races       WHERE id      < ?", (cutoff,))
 
 # =====================================================================
 # App setup
