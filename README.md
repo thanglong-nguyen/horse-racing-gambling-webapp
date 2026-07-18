@@ -76,20 +76,27 @@ projection of what the pool would currently pay.
 
 Two things I changed from the textbook version to fit this game:
 
-- **The house bets too.** A real track has thousands of bettors, so the pool
-  prices itself. With a handful of players, an empty pool has no opinion, so
-  the house seeds every race with phantom money, spread across lanes by a
-  stat-based handicapper (`estimate_strengths`). That gives every race a
-  proper opening line (favorites cheap, longshots wild) before anyone bets,
-  and at settlement the house's phantom stake participates like a real
-  bettor's, which keeps the displayed odds and the actual payouts on the same
-  formula.
-- **Manipulation doesn't pay, by design.** In an earlier version I froze each
-  bet's odds at bet time, and then found the exploit myself: inflate a
-  favorite's displayed odds by dumping money on longshots, then bet big at
-  the frozen price. Pari-mutuel settlement kills this at the root: since
-  winners are paid from the pool itself, pumping the pool just dilutes your
-  own share. There's nothing to lock in and nothing to game.
+- **The house bets too, and it reads the race card.** A real track has
+  thousands of bettors, so the pool prices itself. With a handful of players,
+  an empty pool has no opinion, so the house seeds every race with phantom
+  money. This is the real difference from plain pari-mutuel: the phantom
+  money isn't spread evenly. A built-in handicapper (`estimate_strengths`)
+  scores every horse on its speed, stamina, stamina drain, and starting lane
+  (inner lanes run a shorter loop, and it matters a lot), then places the
+  house's phantom stake proportionally. So the opening line already looks
+  like a real race card, favorites cheap and longshots wild, before a single
+  bet lands. At settlement the phantom stake participates like a real
+  bettor's, which keeps the displayed odds and the actual payouts on the
+  same formula.
+- **Manipulation doesn't pay, by design.** An earlier version locked in each
+  bet's odds at the moment you placed it, and that opened a hole: dump money
+  on longshots to push the favorite's displayed odds up, then bet big on the
+  favorite at that inflated locked-in price. Free money, every race. Instead
+  of patching it, I switched to true pari-mutuel settlement, where the
+  attack defeats itself: winners are paid out of the pool, so any money you
+  pump in to distort the odds becomes part of the pot your own bet has to
+  win back, diluted by your own stake. There is no locked-in price to abuse,
+  because nothing is promised until the pool closes.
 
 Longshot odds are uncapped on purpose. Yes, you'll occasionally see 900x on a
 doomed horse in lane 7. And no, the house can't go broke, because your own
