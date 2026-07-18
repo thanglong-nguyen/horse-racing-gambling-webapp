@@ -78,6 +78,10 @@
         <!-- shown when we have a token -->
         <div id="wallet" style="display:none;">
             <strong id="player-name"></strong> — balance: $<span id="balance"></span>
+            <label style="margin-left: 16px;">
+                Stake: $<input id="stake-input" type="number" value="100"
+                               min="1" step="1" style="width:70px">
+            </label>
         </div>
     </div>
 
@@ -250,7 +254,11 @@
         }
 
         async function placeBet(lane) {
-            const amount = 100;   // fixed stake for now — input field later
+            const amount = Number(document.getElementById('stake-input').value);
+            if (!Number.isFinite(amount) || amount < 1) {
+                alert("Enter a valid stake (min $1)");
+                return;
+            }
             const resp = await fetch('/bet', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -376,7 +384,7 @@
                     <td>${colorDot(horse.lane)}Lane ${horse.lane}</td>
                     <td><strong>${horse.name}</strong> (Spd: ${horse.base_speed} | Stm: ${horse.stamina})</td>
                     <td>${horse.odds.toFixed(2)}x</td>
-                    <td><button class="bet-btn" data-lane="${horse.lane}">Bet $100</button></td>
+                    <td><button class="bet-btn" data-lane="${horse.lane}">Bet</button></td>
                 </tr>
             `).join('');
 
