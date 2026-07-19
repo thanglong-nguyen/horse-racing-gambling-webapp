@@ -144,4 +144,5 @@ Open two browser windows with different names to bet against yourself.
 - [ ] React migration (planned as its own learning chapter)
 - [ ] A better odds model (extreme favorites are still slightly underpriced)
 - [ ] WebSockets (replace polling)
-- [ ] Rate limiting before public hosting
+- [ ] Improve Triomphe 
+
