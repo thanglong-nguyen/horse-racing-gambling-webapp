@@ -4,13 +4,14 @@ import random
 import secrets
 import time
 import sqlite3
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from typing import Dict, List, Tuple
 
 from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, JSONResponse
 from pydantic import BaseModel, RootModel
 
 from db import get_db, init_db
@@ -32,11 +33,14 @@ class RaceHorseInfo(BaseModel):
     stamina: float
     loss_rate: float
     odds: float
+    pool: float          # money (real bets + house seed) on this lane
 
 class CurrentRaceResponse(BaseModel):
     race_id: int
     betting_closes_at: float
     seconds_left: float
+    total_pool: float    # whole pool (real + seed) — lets the client
+    house_edge: float    # project "your payout" for any stake honestly
     horses: List[RaceHorseInfo]
 
 class PlayerBalanceResponse(BaseModel):
@@ -156,9 +160,10 @@ def estimate_strengths(horses):
 
     return {lane: powered[lane] / total for lane in powered}
 
-def recompute_odds(cursor, race_id):
-    """Reprice all lanes from stats + betting pool.
-    Runs inside the caller's transaction — NO commit in here."""
+def get_pool(cursor, race_id):
+    """The single source of pool truth: (grand_total, {lane: lane_money}),
+    where lane_money = real bets on the lane + the house's phantom seed
+    share. Used by pricing, the /race/current endpoint, and settlement."""
     # 1. Load stats -> house handicap
     cursor.execute(
         """
@@ -186,16 +191,20 @@ def recompute_odds(cursor, race_id):
         real_money.setdefault(row["lane"], 0.0)
 
     # 3. Totals (real + phantom seed)
-    real_total = sum(real_money.values())
-    grand_total = real_total + TOTAL_SEED
+    grand_total = sum(real_money.values()) + TOTAL_SEED
+    lane_money = {
+        row["lane"]: real_money[row["lane"]] + TOTAL_SEED * strengths[row["lane"]]
+        for row in horses
+    }
+    return grand_total, lane_money
 
-    # 4. Reprice every lane
-    for row in horses:
-        lane = row["lane"]
-        seed_lane = TOTAL_SEED * strengths[lane]
-        lane_money = real_money[lane] + seed_lane
+def recompute_odds(cursor, race_id):
+    """Reprice all lanes from stats + betting pool.
+    Runs inside the caller's transaction — NO commit in here."""
+    grand_total, lane_money = get_pool(cursor, race_id)
 
-        odds = grand_total * (1 - HOUSE_EDGE) / lane_money
+    for lane, money in lane_money.items():
+        odds = grand_total * (1 - HOUSE_EDGE) / money
         odds = max(MIN_ODDS, round(odds, 2))
 
         cursor.execute(
@@ -316,16 +325,13 @@ def settle_race(race_id, winning_lane):
     try:
         cursor = conn.cursor()
 
-        # House handicap — the same strengths used for pricing
-        cursor.execute(
-            """
-            SELECT lane, base_speed, stamina, loss_rate
-            FROM race_horses
-            WHERE race_id = ?
-            """,
-            (race_id,)
-        )
-        strengths = estimate_strengths(cursor.fetchall())
+        # Same pool the board priced from — display and payout must agree
+        grand_pool, lane_money = get_pool(cursor, race_id)
+        payout_pool = grand_pool * (1 - HOUSE_EDGE)
+        # Winning side = real money on the lane + the house's seed bet
+        # on it. The house's own share of the winnings simply stays with
+        # the house — no row to update.
+        winner_money = lane_money[winning_lane]
 
         cursor.execute(
             """
@@ -336,17 +342,6 @@ def settle_race(race_id, winning_lane):
             (race_id,)
         )
         bets = cursor.fetchall()
-
-        real_total = sum(bet["amount"] for bet in bets)
-        real_winner_pool = sum(bet["amount"] for bet in bets
-                               if bet["lane"] == winning_lane)
-
-        grand_pool = real_total + TOTAL_SEED
-        payout_pool = grand_pool * (1 - HOUSE_EDGE)
-        # Winning side = real money on the lane + the house's seed bet
-        # on it. The house's own share of the winnings simply stays with
-        # the house — no row to update.
-        winner_money = real_winner_pool + TOTAL_SEED * strengths[winning_lane]
 
         for bet in bets:
             if bet["lane"] != winning_lane:
@@ -376,9 +371,8 @@ def settle_race(race_id, winning_lane):
 
         conn.commit()      # ONE commit for the entire settlement
         print(f"[settle] race {race_id}: lane {winning_lane} won, "
-              f"real pool {real_total:.2f}, "
-              f"winner side {winner_money:.2f} "
-              f"(real {real_winner_pool:.2f})")
+              f"grand pool {grand_pool:.2f}, "
+              f"winner side {winner_money:.2f}")
     finally:
         conn.close()
 
@@ -508,6 +502,41 @@ async def add_process_time_header(request: Request, call_next):
     return response
 
 # =====================================================================
+# Rate limiting — sliding window per IP, in memory (fine for one worker;
+# resets on redeploy, same as the rest of the free-tier state)
+# =====================================================================
+
+RATE_LIMITS = {              # path -> (max requests, window seconds)
+    "/player": (5, 3600),    # signups are the scriptable endpoint
+    "/bet":    (20, 60),     # no human bets 20 times a minute
+}
+_hits = defaultdict(deque)   # (ip, path) -> timestamps of recent requests
+
+@app.middleware("http")
+async def rate_limit(request: Request, call_next):
+    limit = RATE_LIMITS.get(request.url.path)
+    if limit and request.method == "POST":
+        max_req, window = limit
+        # Behind Render's proxy, client.host is the proxy itself —
+        # the real visitor is the first entry of X-Forwarded-For.
+        ip = (request.headers.get("x-forwarded-for")
+              or request.client.host).split(",")[0].strip()
+
+        now = time.time()
+        q = _hits[(ip, request.url.path)]
+        while q and q[0] < now - window:   # forget requests outside the window
+            q.popleft()
+
+        if len(q) >= max_req:
+            # Return (not raise): exceptions in middleware bypass the
+            # normal HTTPException handling.
+            return JSONResponse(status_code=429,
+                                content={"detail": "Too many requests, slow down"})
+        q.append(now)
+
+    return await call_next(request)
+
+# =====================================================================
 # Endpoints
 # =====================================================================
 
@@ -550,10 +579,19 @@ def get_current_race():
 
         horses = [dict(row) for row in cursor.fetchall()]
 
+        # Pool sizes let the client project "your payout" for any stake
+        # with the same formula settlement uses. Real tote boards show
+        # pool totals too — this is disclosure, not a leak.
+        grand_total, lane_money = get_pool(cursor, race_id)
+        for horse in horses:
+            horse["pool"] = round(lane_money[horse["lane"]], 2)
+
         return {
             "race_id": race_id,
             "betting_closes_at": closes_at,
             "seconds_left": round(max(0.0, closes_at - now), 2),
+            "total_pool": round(grand_total, 2),
+            "house_edge": HOUSE_EDGE,
             "horses": horses,
         }
     finally:
