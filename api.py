@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import random
 import secrets
 import time
@@ -293,17 +294,17 @@ async def race_scheduler():
         print(f"[scheduler] race {race_id}: replay window {replay_duration:.0f}s")
         await asyncio.sleep(replay_duration + REPLAY_BUFFER)
 
+        # Status already flipped to 'settled' inside settle_race's
+        # transaction — this pause was just the audience watching.
         conn = get_db()
         try:
             cursor = conn.cursor()
             prune_old_races(cursor, race_id)
-            cursor.execute("UPDATE races SET status = 'settled' WHERE id = ?",
-                           (race_id,))
-            conn.commit()   # prune + status flip land together
+            conn.commit()
         finally:
             conn.close()
 
-        print(f"[scheduler] race {race_id}: settled\n")
+        print(f"[scheduler] race {race_id}: cycle complete\n")
 
 def settle_race(race_id, winning_lane):
     """Pari-mutuel settlement with the house in the pool.
@@ -366,6 +367,16 @@ def settle_race(race_id, winning_lane):
             SET settled = 1
             WHERE race_id = ? AND settled = 0
             """,
+            (race_id,)
+        )
+
+        # Status flips to 'settled' in the SAME transaction as the
+        # payouts. If it flipped later (after the replay pause, as it
+        # once did), a restart during that window would let the startup
+        # sweep 'void' a race that actually paid out — no money bug,
+        # but a lying record. The replay pause is purely cosmetic now.
+        cursor.execute(
+            "UPDATE races SET status = 'settled' WHERE id = ?",
             (race_id,)
         )
 
@@ -458,6 +469,16 @@ def prune_old_races(cursor, current_race_id):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # This app is single-process BY DESIGN: the in-memory rate-limit
+    # dict, the track assets, and above all the ONE race scheduler.
+    # Two workers would mean two schedulers creating interleaved races.
+    # Fail loudly at boot instead of corrupting the game quietly.
+    workers = int(os.environ.get("WEB_CONCURRENCY", "1"))
+    if workers != 1:
+        raise RuntimeError(
+            "Triomphe is single-process by design (one scheduler, "
+            "in-memory rate limits). Run with exactly 1 worker.")
+
     print("Initializing Database Schema...")
     init_db()
     sweep_orphan_races()
@@ -517,10 +538,12 @@ async def rate_limit(request: Request, call_next):
     limit = RATE_LIMITS.get(request.url.path)
     if limit and request.method == "POST":
         max_req, window = limit
-        # Behind Render's proxy, client.host is the proxy itself —
-        # the real visitor is the first entry of X-Forwarded-For.
+        # Behind Render's proxy, client.host is the proxy itself. In
+        # X-Forwarded-For, the CLIENT controls the leading entries (it
+        # can send the header pre-filled to spoof IPs); only the LAST
+        # entry — appended by our own trusted proxy — is real.
         ip = (request.headers.get("x-forwarded-for")
-              or request.client.host).split(",")[0].strip()
+              or request.client.host).split(",")[-1].strip()
 
         now = time.time()
         q = _hits[(ip, request.url.path)]
