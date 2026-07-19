@@ -27,9 +27,9 @@ CREATE TABLE IF NOT EXISTS race_horses (
     name        TEXT NOT NULL,
     base_speed  REAL,
     stamina     REAL,
-    loss_rate   REAL,                  -- Matched to your comment name
+    loss_rate   REAL,                  
     odds        REAL NOT NULL          -- decimal odds, frozen at race creation
-);                                     -- Added the missing semicolon here
+);                                  
 
 -- players table      (id, name UNIQUE, token UNIQUE, balance)
 
