@@ -92,6 +92,12 @@
             <thead><tr></tr></thead>
             <tbody id="results-body"></tbody>
         </table>
+
+        <p id="odds-note" style="display:none; font-size: 13px; color: #718096; margin-top: 10px;">
+            Payouts are pari-mutuel: everyone's bets share one pool, so odds
+            keep shifting until betting closes. "Your Payout" already includes
+            the effect of your own stake entering the pool.
+        </p>
     </div>
 
     <script>
@@ -365,6 +371,8 @@
 
         // ================= tables =================
         function buildResultsTable(results) {
+            currentRaceData = null;   // betting is over — stake edits shouldn't redraw
+            document.getElementById('odds-note').style.display = "none";
             tableHeadRow.innerHTML = `<th>Place</th><th>Horse</th><th>Total Time</th>`;
             tableBody.innerHTML = results.map((result, index) => `
                 <tr>
@@ -376,23 +384,52 @@
             table.style.display = "table";
         }
 
-        function buildBettingTable(horses) {
+        // "If my stake entered right now": both the pool and the lane
+        // grow by it — the same formula settlement uses, so this number
+        // is what you'd actually be paid if the pool froze here.
+        function projectedPayout(horse, stake, race) {
+            const multiple = (race.total_pool + stake) * (1 - race.house_edge)
+                           / (horse.pool + stake);
+            return stake * Math.max(1.0, multiple);   // server's minimum-payoff rule
+        }
+
+        function currentStake() {
+            const stake = Number(document.getElementById('stake-input').value);
+            return (Number.isFinite(stake) && stake >= 1) ? stake : null;
+        }
+
+        function buildBettingTable(race) {
+            const stake = currentStake();
+
             tableHeadRow.innerHTML = `<th>Lane</th><th>Horse Spec Sheet</th>
-                <th>Approx. Odds</th><th>Bet</th>`;
-            tableBody.innerHTML = horses.map(horse => `
-                <tr>
-                    <td>${colorDot(horse.lane)}Lane ${horse.lane}</td>
-                    <td><strong>${horse.name}</strong> (Spd: ${horse.base_speed} | Stm: ${horse.stamina})</td>
-                    <td>${horse.odds.toFixed(2)}x</td>
-                    <td><button class="bet-btn" data-lane="${horse.lane}">Bet</button></td>
-                </tr>
-            `).join('');
+                <th>Your Odds</th><th>Your Payout</th><th>Bet</th>`;
+            tableBody.innerHTML = race.horses.map(horse => {
+                let oddsCell, payoutCell;
+                if (stake === null) {
+                    oddsCell = horse.odds.toFixed(2) + "x";   // marginal board price
+                    payoutCell = "enter a stake";
+                } else {
+                    const payout = projectedPayout(horse, stake, race);
+                    oddsCell = (payout / stake).toFixed(2) + "x";  // YOUR real multiple
+                    payoutCell = "$" + payout.toFixed(0);
+                }
+                return `
+                    <tr>
+                        <td>${colorDot(horse.lane)}Lane ${horse.lane}</td>
+                        <td><strong>${horse.name}</strong> (Spd: ${horse.base_speed} | Stm: ${horse.stamina})</td>
+                        <td>${oddsCell}</td>
+                        <td>${payoutCell}</td>
+                        <td><button class="bet-btn" data-lane="${horse.lane}">Bet</button></td>
+                    </tr>`;
+            }).join('');
 
             tableBody.querySelectorAll('.bet-btn').forEach(btn => {
                 btn.addEventListener('click', () => placeBet(Number(btn.dataset.lane)));
             });
 
             table.style.display = "table";
+            document.getElementById('odds-note').style.display = "block";
+
         }
 
         function disableBetButtons() {
@@ -403,6 +440,8 @@
 
         // ================= lifecycle =================
         let currentRaceId = null;
+        let currentRaceData = null;   // last /race/current payload, so the
+                                      // stake field can re-render payouts
 
         async function lifecycleLoop() {
             try {
@@ -416,8 +455,9 @@
 
                 const race = await resp.json();
                 currentRaceId = race.race_id;
+                currentRaceData = race;
 
-                buildBettingTable(race.horses);
+                buildBettingTable(race);
                 startCountdown(race.seconds_left);
             } catch (err) {
                 console.error("[Lifecycle Error]:", err);
@@ -449,7 +489,8 @@
                                 // Only rebuild if it's still the same race —
                                 // a 404/new race is the lifecycle loop's job.
                                 if (race && race.race_id === currentRaceId) {
-                                    buildBettingTable(race.horses);
+                                    currentRaceData = race;
+                                    buildBettingTable(race);
                                 }
                             })
                             .catch(() => {});   // countdown must not die on a blip
@@ -490,6 +531,10 @@
 
         // ================= boot =================
         document.getElementById('join-btn').addEventListener('click', joinGame);
+        document.getElementById('stake-input').addEventListener('input', () => {
+            // retype the stake -> payout column updates instantly
+            if (currentRaceData) buildBettingTable(currentRaceData);
+        });
         refreshBalance();
         initTrack();
         lifecycleLoop();
