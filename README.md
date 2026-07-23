@@ -54,11 +54,18 @@ scheduler on the server:
 
 - The race is simulated **only after betting closes**, and the result never
   leaves the server before then.
-- Every race stores its RNG seed, drawn from OS entropy (`secrets`), so any
-  past race can be re-run and verified -> provable fairness.
 - Betting and payouts are handled in single database transactions, so money
   can't half-move: a bet either fully happens or fully doesn't. If the server
   crashes mid-race, a startup sweep voids the race and refunds everyone.
+
+### Provably fair, and unpredictable even to a clone
+
+Every race is generated from a secret seed drawn from OS entropy
+(`secrets`). Even someone running my exact engine, line for line, can't
+predict the live race, because they don't have the seed. And because the seed is *stored*, any past race can be replayed and
+verified move for move. One mechanism, two properties, the same seed that
+keeps a race unpredictable while it matters is what makes it provably fair
+afterwards.
 
 ### Precompute-then-replay
 The server simulates the race once and stores a slimmed-down position history
@@ -144,5 +151,5 @@ Open two browser windows with different names to bet against yourself.
 - [ ] React migration (planned as its own learning chapter)
 - [ ] A better odds model (extreme favorites are still slightly underpriced)
 - [ ] WebSockets (replace polling)
-- [ ] Improve Triomphe 
+- [ ] Improve the pathfinding algorithm  
 
